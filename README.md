@@ -2,7 +2,7 @@
 
 # spicyapi/spicyapi
 
-**Official PHP SDK for [SpicyAPI](https://spicyapi.ai)** — image, video and text models behind one API.
+**Official PHP SDK for [SpicyAPI](https://spicyapi.ai)** — image, video, audio and text models behind one API.
 
 [Get a key](https://spicyapi.ai) · [Models](https://spicyapi.ai/models) · [Docs](https://docs.spicyapi.ai) · [Status](https://status.spicyapi.ai)
 
@@ -10,7 +10,7 @@
 
 ---
 
-One endpoint in front of 83 model families across 121 callable endpoints, billed in USD per request
+One endpoint in front of 142 model families across 214 callable endpoints, billed in USD per request
 rather than in credits. Media generation is asynchronous and quotable before you spend; text models
 speak the OpenAI, Anthropic and Gemini wire formats.
 
@@ -89,6 +89,18 @@ $task = $client->createTask(
 );
 ```
 
+Images, MP4/WebM video, MP3/WAV audio and reference documents (PDF, Word, Excel, PowerPoint,
+Keynote, Pages, Numbers, plain text, Markdown) can all be uploaded; the type is inferred from the
+extension, or pass `UploadContentType::Pdf` and friends explicitly.
+
+## Not every result is a file
+
+Speech-to-text answers in text, so check `SpicyClient::outputText($task)` before reaching for the
+assets. A transcription that reports timing also carries `output.transcript`, with the detected
+language and per-word start and end times. A layer decomposition returns a base image followed by
+transparent layers, each with a `layer` object holding its `zIndex` and, when the model reports it,
+a `boundingBox` on the base.
+
 ## Webhooks
 
 ```php
@@ -153,6 +165,7 @@ Branch on the business code, never on the message — messages are translated, c
 | --- | --- | --- |
 | `40003` | uploaded bytes do not match their ticket | upload again |
 | `40004` | no deployment serves that parameter combination | change the named parameter |
+| `40310` | the account has not verified its email address | open the verification link; the same key then works |
 | `409` | the idempotency key was reused for a different request, or by a sibling key | resend the original request under that key, or the changed one under a new key |
 | `40901` | the price moved before the task was created | quote again, keep the same idempotency key |
 | `503` | a dependency is briefly unavailable | back off by `Retry-After` |
@@ -172,6 +185,11 @@ not prove the task was not created.
 
 **Text models.** They speak the OpenAI, Anthropic and Gemini wire formats; the established PHP
 clients for those already work against `https://api.spicyapi.ai/v1`.
+
+Chat models that read images, video or audio still need this package for one thing: getting a local
+file to them. Upload it here and put the returned `spicy://f/…` URI in an `image_url`, `video_url`
+or `audio_url` content part. Uploaded images also keep the up-front hold small, and an `audio_url`
+part accepts only an uploaded file.
 
 **Browser-side code.** The key belongs on your server, never in anything you ship to a visitor.
 

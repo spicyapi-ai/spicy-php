@@ -1,6 +1,6 @@
 {
   "name": "spicyapi/spicyapi",
-  "description": "Official PHP client for SpicyAPI — image, video and text generation behind one API.",
+  "description": "Official PHP client for SpicyAPI — image, video, audio and text generation behind one API.",
   "type": "library",
   "license": "MIT",
   "homepage": "https://spicyapi.ai",

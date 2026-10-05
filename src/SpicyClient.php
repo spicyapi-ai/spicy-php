@@ -3,8 +3,8 @@
 /**
  * Official SpicyAPI client for PHP 8.1+.
  *
- * SpicyAPI serves image and video generation models behind one API. This package
- * covers the asynchronous media workflow end to end: discover a model and its
+ * SpicyAPI serves image, video and audio generation models behind one API. This
+ * package covers the asynchronous media workflow end to end: discover a model and its
  * input schema, upload local reference material, quote a request, submit it,
  * wait for a terminal state, and collect the result.
  *
@@ -20,11 +20,15 @@
  * quoted from it in the comments so a reader can check them against the source
  * instead of trusting this file.
  *
- * Scope: SpicyAPI is mostly image and video generation, which is asynchronous —
- * create a task, then poll or receive a webhook. That is what this client wraps.
- * Text models speak OpenAI / Anthropic / Gemini on `/v1` and `/v1beta`; for
- * those, point an official SDK at `https://api.spicyapi.ai/v1` and change
- * nothing else. There is no reason to wrap them here.
+ * Scope: SpicyAPI is mostly image, video and audio generation, which is
+ * asynchronous — create a task, then poll or receive a webhook. That is what this
+ * client wraps. Text models speak OpenAI / Anthropic / Gemini on `/v1` and
+ * `/v1beta`; for those, point an official SDK at `https://api.spicyapi.ai/v1` and
+ * change nothing else. There is no reason to wrap them here. The one piece of
+ * this client a chat request still needs is upload: a local image, video or
+ * audio file goes to a chat model as the `spicy://f/...` URI that
+ * {@see SpicyClient::uploadFile()} returns, inside an `image_url`, `video_url`
+ * or `audio_url` content part.
  *
  * Usage (every optional argument is a named argument):
  *
@@ -143,6 +147,10 @@ enum TaskErrorCode: string
  *
  * openapi.yaml `UploadURLRequest.contentType`. Anything else is rejected before
  * a ticket is issued, so the enum is the whole list.
+ *
+ * Documents (PDF, Office, iWork, plain text and Markdown) are reference files
+ * for the models whose schema asks for one. The server checks only that the
+ * bytes belong to the declared family; it does not read the content.
  */
 enum UploadContentType: string
 {
@@ -154,6 +162,18 @@ enum UploadContentType: string
     case Webm = 'video/webm';
     case Mp3 = 'audio/mpeg';
     case Wav = 'audio/wav';
+    case Pdf = 'application/pdf';
+    case Doc = 'application/msword';
+    case Docx = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+    case Xls = 'application/vnd.ms-excel';
+    case Xlsx = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+    case Ppt = 'application/vnd.ms-powerpoint';
+    case Pptx = 'application/vnd.openxmlformats-officedocument.presentationml.presentation';
+    case Keynote = 'application/vnd.apple.keynote';
+    case Pages = 'application/vnd.apple.pages';
+    case Numbers = 'application/vnd.apple.numbers';
+    case Text = 'text/plain';
+    case Markdown = 'text/markdown';
 
     /** File extensions this client can map on its own. */
     private const EXTENSIONS = [
@@ -166,6 +186,19 @@ enum UploadContentType: string
         'webm' => 'video/webm',
         'mp3' => 'audio/mpeg',
         'wav' => 'audio/wav',
+        'pdf' => 'application/pdf',
+        'doc' => 'application/msword',
+        'docx' => 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        'xls' => 'application/vnd.ms-excel',
+        'xlsx' => 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        'ppt' => 'application/vnd.ms-powerpoint',
+        'pptx' => 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+        'key' => 'application/vnd.apple.keynote',
+        'pages' => 'application/vnd.apple.pages',
+        'numbers' => 'application/vnd.apple.numbers',
+        'txt' => 'text/plain',
+        'md' => 'text/markdown',
+        'markdown' => 'text/markdown',
     ];
 
     public function isImage(): bool
@@ -173,11 +206,20 @@ enum UploadContentType: string
         return str_starts_with($this->value, 'image/');
     }
 
+    /** True for the reference document types: neither image, audio nor video. */
+    public function isDocument(): bool
+    {
+        return !$this->isImage()
+            && !str_starts_with($this->value, 'video/')
+            && !str_starts_with($this->value, 'audio/');
+    }
+
     /**
      * Per-type ceiling, from the `createUploadUrl` description: 10 MiB for
      * images, 90 MiB for supported audio and video (which is also the `bytes`
-     * maximum of 94371840 in the request schema). Audio and video additionally
-     * must be at most 600 seconds, which only the server can measure.
+     * maximum of 94371840 in the request schema). Documents get the same
+     * 90 MiB as audio and video. Audio and video additionally must be at most
+     * 600 seconds, which only the server can measure.
      *
      * This is a local sanity check. The ticket's own `maxBytes` is what the
      * server will enforce, and {@see SpicyClient::uploadBytes()} checks that too.
@@ -279,6 +321,9 @@ class SpicyApiError extends \RuntimeException
             40302 => 'The caller IP is outside this API key\'s allow list. Retrying from the same '
                 . 'address will keep failing.',
             40303 => 'The request came from a region this service does not serve. Not retryable.',
+            40310 => 'The account has not verified its email address yet, so it cannot run models. Open the '
+                . 'verification link sent at sign-up, or send a new one from the Console; the same key '
+                . 'starts working as soon as the address is verified.',
             409 => 'Idempotency conflict. This key was already used for a different request, or it '
                 . 'belongs to a sibling API key of the same account. Resend the original request under '
                 . 'the original key — that returns the first task rather than creating a second — or '
@@ -1576,6 +1621,11 @@ final class SpicyClient
      * would make a task that answered with nothing indistinguishable from one
      * that answered with files.
      *
+     * A speech-to-text task that reports timing also carries
+     * `output.transcript` — the detected language, per-word `start` / `end`
+     * seconds and, for multichannel audio, one entry per channel. It is part of
+     * the returned array as delivered; this method returns only the plain text.
+     *
      * @param array<string,mixed> $task
      */
     public static function outputText(array $task): ?string
@@ -1594,6 +1644,11 @@ final class SpicyClient
      *
      * Assets may be `pending` (still being stored) or `unavailable` (gone), and
      * both of those lack a `url`. {@see self::readyAssets()} filters them out.
+     *
+     * Order matters on a layer decomposition: the first asset is the base image
+     * and each later one is a transparent layer whose `layer` object holds its
+     * `zIndex` and, when the model reports it, the `boundingBox` that places it
+     * on the base. Stack by ascending `zIndex` to rebuild the picture.
      *
      * @param array<string,mixed> $task
      *

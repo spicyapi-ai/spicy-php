@@ -391,6 +391,49 @@ try { UploadContentType::forPath('/a/b/c.mov'); check('unknown extension rejecte
 catch (InvalidArgumentException $e) { check('unknown extension rejected', str_contains($e->getMessage(), 'mp4')); }
 unlink($tmp);
 
+// Reference documents. Without these cases there is no way to upload one at all: createUploadUrl
+// takes the enum, not a free string.
+// forPath throws on an unknown extension; caught here so a missing mapping fails one check instead
+// of ending the suite.
+$inferred = static function (string $path): ?UploadContentType {
+    try { return UploadContentType::forPath($path); } catch (InvalidArgumentException) { return null; }
+};
+check('PDF inferred from extension', $inferred('/a/brief.PDF') === UploadContentType::Pdf);
+foreach (['a.doc' => 'application/msword', 'a.docx' => 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+          'a.xls' => 'application/vnd.ms-excel', 'a.xlsx' => 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+          'a.ppt' => 'application/vnd.ms-powerpoint', 'a.pptx' => 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+          'a.key' => 'application/vnd.apple.keynote', 'a.pages' => 'application/vnd.apple.pages',
+          'a.numbers' => 'application/vnd.apple.numbers', 'a.txt' => 'text/plain',
+          'a.md' => 'text/markdown'] as $documentPath => $expectedType) {
+    check("$documentPath inferred as $expectedType", $inferred($documentPath)?->value === $expectedType);
+}
+check('documents are documents, media is not',
+    UploadContentType::Pdf->isDocument() && UploadContentType::Markdown->isDocument()
+    && !UploadContentType::Png->isDocument() && !UploadContentType::Mp4->isDocument()
+    && !UploadContentType::Wav->isDocument());
+check('a document gets the 90 MiB ceiling, not the image one', UploadContentType::Pdf->maxBytes() === 94371840);
+$docTicket = ['fileId' => 'fil_doc', 'key' => 'spicy://f/fil_doc', 'uploadUrl' => 'https://storage.example/doc?sig=1',
+    'method' => 'PUT', 'headers' => ['Content-Type' => 'application/pdf'], 'expiresAt' => 'x', 'maxBytes' => 94371840];
+$t = new FakeTransport([envelope($docTicket)]);
+(new SpicyClient(transport: $t, sleeper: $noSleep))->createUploadUrl(UploadContentType::Pdf, 20 * 1024 * 1024);
+check('a 20 MiB PDF is not refused locally and is declared as application/pdf',
+    json_decode($t->calls[0]['body'], true) === ['contentType' => 'application/pdf', 'bytes' => 20 * 1024 * 1024]);
+
+// The enum must equal the pinned contract's list. scripts/check_contract.php compares against the
+// published contract over the network; this runs offline, so a forgotten case fails every local run.
+$pinned = (string) file_get_contents(__DIR__ . '/../contracts/openapi.yaml');
+$anchor = strpos($pinned, '    UploadURLRequest:');
+$pinnedTypes = [];
+if ($anchor !== false && preg_match('/contentType:\s*\{[^}]*enum:\s*\[([^\]]+)\]/', substr($pinned, $anchor, 2000), $m) === 1) {
+    $pinnedTypes = array_map('trim', explode(',', $m[1]));
+}
+sort($pinnedTypes);
+$enumTypes = array_map(static fn (UploadContentType $case): string => $case->value, UploadContentType::cases());
+sort($enumTypes);
+check('the pinned contract lists upload types at all', count($pinnedTypes) >= 8, (string) count($pinnedTypes));
+check('UploadContentType equals the pinned contract enum', $enumTypes === $pinnedTypes,
+    implode(',', array_diff($pinnedTypes, $enumTypes)) . ' | ' . implode(',', array_diff($enumTypes, $pinnedTypes)));
+
 /* ── 9. download-url ───────────────────────────────────────────── */
 echo "download-url\n";
 $t = new FakeTransport([envelope(['key' => 'a', 'url' => 'https://cdn/x?sig=2', 'expiresAt' => 'x'])]);
@@ -786,6 +829,11 @@ check('409 is the idempotency conflict', stripos($advice(409), 'idempotency conf
 check('40901 is the price/quote conflict', stripos($advice(40901), 'price changed') !== false, $advice(40901));
 check('40901 says to keep the original key, not to take a new one',
     stripos($advice(40901), 'keeping the original Idempotency-Key') !== false, $advice(40901));
+// Contract: 40310 is an unverified email address. It is a 403 like a key-scope or IP refusal, and
+// the fix is nothing like theirs - no key or network change helps, verifying the address does.
+check('40310 points at email verification', stripos($advice(40310), 'verif') !== false
+    && stripos($advice(40310), 'email') !== false, $advice(40310));
+check('40310 is not given the generic advice', $advice(40310) !== $advice(40399));
 
 /* -- 16. A poll's timeout is clamped to the remaining budget ---------- */
 echo "polling timeout semantics\n";
@@ -911,7 +959,7 @@ $realProperties = array_map(
 check('every exception property the README names really exists',
     ($namedProperties[1] ?? []) !== [] && array_diff($namedProperties[1], $realProperties) === [],
     'README: ' . implode(',', $namedProperties[1] ?? []) . ' - actual: ' . implode(',', $realProperties));
-foreach ([40003, 40004, 409, 40901, 503, 50301, 50302] as $documentedCode) {
+foreach ([40003, 40004, 40310, 409, 40901, 503, 50301, 50302] as $documentedCode) {
     check("the README error table lists $documentedCode", str_contains($readme, '| `' . $documentedCode . '` |'));
 }
 
