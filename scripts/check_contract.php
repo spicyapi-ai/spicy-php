@@ -13,6 +13,11 @@
  * repository is public and spicy-server is not. Giving a public repository's CI a token that can
  * read a private one puts it somewhere anyone can open a pull request against. The contract is
  * public anyway.
+ *
+ * `--offline` skips the download and checks the constants against the pinned copy alone. It is for
+ * syncing the pin from the server's contract before that contract is published: it proves the
+ * package and the pin agree, and says nothing about whether the pin is current. CI runs the default
+ * mode.
  */
 
 declare(strict_types=1);
@@ -44,14 +49,14 @@ function fetchLive(): string
 }
 
 /** Returns the enum values of $field in the section following $anchor. */
-function enumAfter(string $contract, string $anchor, string $field): array
+function enumAfter(string $contract, string $anchor, string $field, int $windowChars = 4000): array
 {
     $start = strpos($contract, $anchor);
     if ($start === false) {
         fwrite(STDERR, "[contract] the contract has no {$anchor} schema\n");
         exit(1);
     }
-    $window = substr($contract, $start, 4000);
+    $window = substr($contract, $start, $windowChars);
     $at = strpos($window, $field);
     if ($at === false) {
         fwrite(STDERR, "[contract] {$anchor} has no {$field}\n");
@@ -69,34 +74,68 @@ function enumAfter(string $contract, string $anchor, string $field): array
     return $values;
 }
 
-$live = fetchLive();
-$local = is_file(LOCAL) ? file_get_contents(LOCAL) : '';
+$offline = in_array('--offline', array_slice($argv, 1), true);
+$local = is_file(LOCAL) ? (string) file_get_contents(LOCAL) : '';
+if ($offline) {
+    $live = $local;
+} else {
+    $live = fetchLive();
+    if ($local !== $live) {
+        fwrite(STDERR,
+            "[contract] contracts/openapi.yaml is stale against the published contract.\n" .
+            "[contract] refresh it:  curl -sH 'User-Agent: spicyapi-contract-check' " . LIVE_URL . " -o contracts/openapi.yaml\n" .
+            "[contract] then re-check every constant this package hard-codes against that diff.\n");
+        exit(1);
+    }
+}
 
-if ($local !== $live) {
-    fwrite(STDERR,
-        "[contract] contracts/openapi.yaml is stale against the published contract.\n" .
-        "[contract] refresh it:  curl -sH 'User-Agent: spicyapi-contract-check' " . LIVE_URL . " -o contracts/openapi.yaml\n" .
-        "[contract] then re-check every constant this package hard-codes against that diff.\n");
+/**
+ * The sorted values of a backed enum.
+ *
+ * @param class-string<\BackedEnum> $enum
+ *
+ * @return list<string>
+ */
+function enumValues(string $enum): array
+{
+    $values = array_map(static fn (\BackedEnum $case): string => (string) $case->value, $enum::cases());
+    sort($values);
+    return $values;
+}
+
+// Each set below is a complete list both here and in the contract, which is what makes a
+// value-by-value comparison meaningful; an enum's cases() guarantees a newly added member cannot be
+// missed.
+$checks = [
+    // Upload types are refused locally when unknown, so a type the server gains would be refused by
+    // the package while the server plainly accepts it.
+    'upload content types' => [enumValues(\SpicyApi\UploadContentType::class), enumAfter($live, '    UploadURLRequest:', 'contentType:')],
+    // The asset library's failure reasons: a reason the package does not know still reaches the
+    // caller verbatim, but assetErrorReason() would call it unknown and guidance() would not cover it.
+    'asset error reasons' => [enumValues(\SpicyApi\AssetErrorReason::class), enumAfter($live, '    ErrorEnvelope:', '                reason:', 8000)],
+    // Sorts and sources are refused locally when unknown, for the same reason as upload types.
+    'asset list sorts' => [enumValues(\SpicyApi\AssetSort::class), enumAfter($live, 'operationId: listAssets', 'name: sort', 8000)],
+    'asset sources' => [enumValues(\SpicyApi\AssetSource::class), enumAfter($live, '    AssetCreateRequest:', 'source:')],
+];
+
+$failed = false;
+foreach ($checks as $label => [$ours, $theirs]) {
+    if ($ours !== $theirs) {
+        fwrite(STDERR, sprintf(
+            "[contract] %s drifted:\n  package:  %s\n  contract: %s\n",
+            $label,
+            implode(', ', $ours),
+            implode(', ', $theirs),
+        ));
+        $failed = true;
+    }
+}
+if ($failed) {
     exit(1);
 }
 
-// Upload types are a backed enum here and an enum list in the contract - both are complete sets,
-// which is what makes a value-by-value comparison meaningful. The enum's cases() guarantees a newly
-// added member cannot be missed.
-$ours = array_map(
-    static fn (\SpicyApi\UploadContentType $case): string => $case->value,
-    \SpicyApi\UploadContentType::cases(),
+printf(
+    "[contract] matches %s (%d constant sets verified).\n",
+    $offline ? 'the pinned contract (offline)' : 'the published contract',
+    count($checks),
 );
-sort($ours);
-
-$theirs = enumAfter($live, '    UploadURLRequest:', 'contentType:');
-if ($ours !== $theirs) {
-    fwrite(STDERR, sprintf(
-        "[contract] upload content types drifted:\n  package:  %s\n  contract: %s\n",
-        implode(', ', $ours),
-        implode(', ', $theirs),
-    ));
-    exit(1);
-}
-
-echo "[contract] matches the published contract.\n";

@@ -91,7 +91,139 @@ $task = $client->createTask(
 
 Images, MP4/WebM video, MP3/WAV audio and reference documents (PDF, Word, Excel, PowerPoint,
 Keynote, Pages, Numbers, plain text, Markdown) can all be uploaded; the type is inferred from the
-extension, or pass `UploadContentType::Pdf` and friends explicitly.
+extension, or pass `UploadContentType::Pdf` and friends explicitly. Images go up to 10 MiB, the rest
+up to 90 MiB.
+
+LoRA weights (a `.safetensors` file, sent as `application/octet-stream`, `UploadContentType::Lora`)
+go up to 2 GiB, and the committed URI goes into `loras[].path`. A file that large can outlast the
+ten-minute upload timeout, so raise it for big ones:
+
+```php
+$client = new SpicyClient(uploadTimeoutSeconds: 3600.0);
+$lora = $client->uploadFile('/path/to/style.safetensors');
+$input = ['prompt' => 'a lantern in fog', 'loras' => [['path' => $lora['uri']]]];
+```
+
+The other fields of each `loras` entry come from that model's `inputSchema`.
+
+An upload's URI lasts one day. To keep a file for later requests, save it to the
+[asset library](#asset-library).
+
+## Asset library
+
+Added in 0.3.0. Files you use again and again — a character portrait, a style reference, a voice
+sample — belong in your asset library: each saved file gets a stable `uri` of the form
+`spicy://a/<id>` that works in any media field of model inputs sent with keys of the same
+workspace, until it is deleted. The library never hands out a public or permanent link.
+
+The key decides the library. A key created in your personal workspace reaches your personal library;
+a key created in a team workspace, by any member, reaches that team's shared library and never
+anyone's personal one. With a team key, what may change follows the current role of the member who
+created it: owner and admin can save, rename, favorite and delete anything; developer can save, and
+rename, favorite or delete what they saved; billing and readonly can only read and use assets.
+
+```php
+use SpicyApi\AssetSource;
+
+// Save the first output of one of your successful tasks (with a team key, one of the team's).
+// source: 'url' with url: ..., and source: 'upload' with fileId: ..., work the same way. The
+// required Idempotency-Key is added for you.
+$hero = $client->assets->create(source: AssetSource::TaskOutput, taskId: 'job_...', index: 0, name: 'Hero portrait');
+
+// Or upload a local file and save it in one call; the name defaults to the file name.
+$voice = $client->assets->uploadFile('/path/to/voice-sample.wav');
+
+// Later, in any request: the uri goes where the model's schema expects a file.
+$input = ['prompt' => 'Slow push-in, light rain', 'image_url' => $hero['uri']];
+
+// Every saved image, newest first, across all pages.
+foreach ($client->assets->iterAll(kind: 'image', q: 'portrait') as $saved) {
+    echo $saved['uri'], ' ', $saved['name'], ' ', $saved['bytes'], "\n";
+}
+```
+
+| Method | Returns |
+| --- | --- |
+| `assets->create(source:, taskId:, key:, index:, fileId:, url:, name:, idempotencyKey:)` | The saved asset: `id`, `uri`, `name`, `kind`, `bytes`, `favorite`, `model`, `previewUrl`, … |
+| `assets->uploadFile($path, name:, contentType:)` | Uploads with `uploadFile()`, then saves; the saved asset |
+| `assets->list(kind:, source:, q:, favorite:, collectionId:, entityId:, sort:, cursor:, limit:)` | One page: `items`, `nextCursor` (absent on the last page) |
+| `assets->iterAll(...)` | A generator over every matching asset, with the same filters as `list` |
+| `assets->get($assetId)` | One asset with a fresh `previewUrl` |
+| `assets->update($assetId, name:, favorite:)` | The updated asset; only what you pass changes, the `uri` stays the same |
+| `assets->delete($assetId)` | `['id' => ..., 'deleted' => true]`; the `uri` stops working at once |
+| `assets->usage()` | `scope` (which library, role, `canWrite`, `canTopUp`), plan, usage, today's count |
+| `assets->characters->list(assetId:, cursor:, limit:)` / `iterAll(...)` | Characters, newest first: `id`, `name`, `note`, `cover`, `assets` (the images in order), `count` |
+| `assets->characters->get($characterId)` | One character with its images in order |
+
+- `$assetId` may be the bare `ast_…` id or the `spicy://a/…` reference. An empty id, a blank filter,
+  an unknown `sort` or `source`, or a save that mixes two sources throws `InvalidArgumentException`
+  before anything is sent.
+- `source` takes one value or a list of them (`AssetSource` cases or `task_output`, `upload`,
+  `url`). `favorite: true` lists only favorites and `favorite: false` only the rest; leave it null
+  for both.
+- `sort` is `AssetSort::Recent` (the default, newest first), `Oldest`, `Name` or `Size`, or the same
+  values as strings. A `nextCursor` only works with the `sort` it came from; sending it with another
+  one fails with `400`. `iterAll()` keeps your filters and `sort` on every page, and its arguments
+  are checked when you call it, not when the loop starts.
+- Saving the same task output, upload or URL again returns the asset you already have. Pass your
+  own `idempotencyKey` to replay a save safely after an uncertain response, for example across a
+  restart.
+- `previewUrl` is a private preview signed for at most 20 minutes. Show it; store `uri`.
+- Storage unlocks with the owner's lifetime top-ups, and the owner's personal and team libraries
+  share one allowance. `assets->usage()` reports the whole allowance; with a team key whose creator
+  is not the owner, `scope.canTopUp` is false and `lifetimeTopupUsd` and `topupToNextTierUsd` are
+  omitted, so read both with `?? null`.
+- A refused call throws `SpicyApiError` with a `$reason`: `asset_library_locked`,
+  `asset_library_full` and `asset_file_too_large` (400, plan limits — read `assets->usage()` for the
+  numbers), `asset_daily_limit` (429, resets at 00:00 UTC, with `$retryAfterSeconds`),
+  `asset_storage_full` (503, temporary), `asset_permission_denied` (403, the team role does not
+  allow this change), `asset_workspace_forbidden` (403, this key cannot reach that library, for
+  example because its creator left the team) and `asset_entity_name_taken` (409, a character with
+  that name already exists). The set, which matches the contract, is the `AssetErrorReason` enum;
+  `$reason` holds any other value the server sends unchanged, so keep a default branch.
+
+```php
+use SpicyApi\AssetErrorReason;
+use SpicyApi\SpicyApiError;
+
+try {
+    $client->assets->create(source: 'url', url: 'https://example.com/still.png');
+} catch (SpicyApiError $error) {
+    if ($error->assetErrorReason() !== AssetErrorReason::LibraryFull) {
+        throw $error;
+    }
+    $usage = $client->assets->usage();
+    printf("Full on %s; next plan: %s\n", $usage['tier']['name'], $usage['nextTier']['name'] ?? 'none');
+}
+```
+
+### Favorites, folders and characters
+
+Every asset has a `favorite` flag; in a team library everyone sees the same favorites. Folders
+(collections in the API) and characters are created and arranged on the Assets page of the web app;
+the API reads them. Each asset also carries `model` and `modelName`, the model that generated it
+(empty strings for uploads and links).
+
+```php
+use SpicyApi\AssetSort;
+
+// Mark a favorite, then list only favorites in one folder, A to Z.
+$client->assets->update($hero['uri'], favorite: true);
+$page = $client->assets->list(favorite: true, collectionId: 'col_...', sort: AssetSort::Name);
+
+// A character is a named, ordered set of images. Put its images, in order, into the model's
+// reference image field (getModel() shows which field takes a list of images).
+$mia = $client->assets->characters->get('ety_...');
+$references = array_column($mia['assets'], 'uri');      // ['spicy://a/ast_...', ...]
+```
+
+An unknown folder, and an unknown character, both fail with `404`. Characters used to be called
+personas: existing `spicy://p/<id>` references keep resolving to the same images, in your personal
+library only; new code should use the `spicy://a/` references a character lists.
+
+See the asset library guide:
+[organizing](https://docs.spicyapi.ai/docs/media#asset-library-organize) and
+[characters](https://docs.spicyapi.ai/docs/media#asset-library-characters).
 
 ## Not every result is a file
 
@@ -156,9 +288,11 @@ paid calls that looks like a hang. `iterTasks()` does all of that.
 
 ## Errors
 
-Failures throw `SpicyApiError` carrying `$businessCode`, `$requestId` and `$retryAfterSeconds`.
+Failures throw `SpicyApiError` carrying `$businessCode`, `$requestId`, `$retryAfterSeconds` and `$reason`.
+`$reason` is null unless the server sent one (see [Asset library](#asset-library)).
 
-Branch on the business code, never on the message — messages are translated, codes are not. **HTTP
+Branch on the business code or the reason, never on the message — messages are translated, codes
+are not. **HTTP
 503 is shared by three different business codes**, so the status alone cannot tell you what to do:
 
 | Code | Meaning | What to do |
@@ -172,7 +306,13 @@ Branch on the business code, never on the message — messages are translated, c
 | `50301` | no usable deployment or price right now | refresh the catalogue |
 | `50302` | a synchronous generation failed upstream and was refunded | retry with a **new** idempotency key |
 
-`$error->guidance()` returns the same advice at runtime.
+`$error->guidance()` returns the same advice at runtime, and the more specific advice for a known
+`$reason`.
+
+Retryable failures are retried with backoff inside one request's timeout. When the server's
+`Retry-After` is longer than the client's retry ceiling or than what that timeout has left, the
+error is thrown at once, with its `$retryAfterSeconds`, instead of being slept through into a local
+timeout.
 
 ## Two things that will save you money
 

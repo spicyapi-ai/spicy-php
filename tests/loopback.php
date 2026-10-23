@@ -104,6 +104,24 @@ foreach (['CurlTransport' => new CurlTransport(), 'StreamTransport' => new Strea
     check("$name: Content-Type arrives", ($echo['headers']['content-type'] ?? '') === 'application/json');
     check("$name: UTF-8 is not escaped", str_contains($echo['body'], "caf\u{e9}"), $echo['body']);
 
+    // The asset library uses two methods nothing else here does, PATCH and DELETE, and the only
+    // header the client generates by itself. All three must survive a real socket on both transports.
+    $echo = $client->assets->create(source: 'url', url: 'https://example.com/still.png', name: $prompt);
+    check("$name: an asset save is a POST to /assets", $echo['method'] === 'POST' && str_ends_with($echo['path'], '/api/v1/assets'));
+    check("$name: the generated Idempotency-Key arrives",
+        str_starts_with($echo['headers']['idempotency-key'] ?? '', 'spicy-'), json_encode($echo['headers']));
+    check("$name: the save body round-trips", json_decode($echo['body'], true)['name'] === $prompt);
+    $echo = $client->assets->update('spicy://a/ast_live', favorite: true);
+    check("$name: PATCH arrives with its body", $echo['method'] === 'PATCH'
+        && str_ends_with($echo['path'], '/assets/ast_live') && json_decode($echo['body'], true) === ['favorite' => true],
+        json_encode($echo));
+    $echo = $client->assets->delete('ast_live');
+    check("$name: DELETE arrives with no body", $echo['method'] === 'DELETE' && $echo['body'] === '', json_encode($echo));
+    $echo = $client->assets->list(q: 'hero shot', favorite: false, source: ['task_output', 'upload']);
+    parse_str((string) parse_url($echo['path'], PHP_URL_QUERY), $received);
+    check("$name: the listing filters arrive decoded as sent",
+        $received === ['source' => 'task_output,upload', 'q' => 'hero shot', 'favorite' => 'false'], $echo['path']);
+
     // Retry: a 503 with Retry-After.
     $t0 = microtime(true);
     $result = (new ReflectionClass($client)) instanceof ReflectionClass ? null : null;

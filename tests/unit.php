@@ -4,9 +4,14 @@ declare(strict_types=1);
 
 require_once __DIR__ . '/../src/SpicyClient.php';
 
+use SpicyApi\AssetErrorReason;
+use SpicyApi\AssetSort;
+use SpicyApi\AssetSource;
 use SpicyApi\CurlTransport;
 use SpicyApi\HttpResponse;
 use SpicyApi\SpicyApiError;
+use SpicyApi\SpicyAssetCharacters;
+use SpicyApi\SpicyAssets;
 use SpicyApi\SpicyClient;
 use SpicyApi\SpicyTimeoutError;
 use SpicyApi\SpicyTransportError;
@@ -919,6 +924,375 @@ if ($blackhole === false) {
     }
 }
 
+/* -- 17.5 LoRA weights --------------------------------------------------- */
+echo "LoRA weights\n";
+check('.safetensors is inferred as LoRA weights', UploadContentType::forPath('/w/style.SafeTensors') === UploadContentType::Lora);
+check('LoRA weights travel as application/octet-stream', UploadContentType::Lora->value === 'application/octet-stream');
+check('LoRA weights are neither a document nor an image',
+    UploadContentType::Lora->isLora() && !UploadContentType::Lora->isDocument() && !UploadContentType::Lora->isImage());
+check('LoRA weights get their own 2 GiB ceiling', UploadContentType::Lora->maxBytes() === 2147483648);
+check('no other type gets the LoRA ceiling', UploadContentType::Mp4->maxBytes() === 94371840 && !UploadContentType::Pdf->isLora());
+$loraTicket = ['fileId' => 'fil_lora', 'key' => 'spicy://f/fil_lora', 'uploadUrl' => 'https://storage.example/l?sig=1',
+    'method' => 'PUT', 'headers' => ['Content-Type' => 'application/octet-stream'], 'expiresAt' => 'x', 'maxBytes' => 2147483648];
+$t = new FakeTransport([envelope($loraTicket)]);
+(new SpicyClient(transport: $t, sleeper: $noSleep))->createUploadUrl(UploadContentType::Lora, 1536 * 1024 * 1024);
+check('a 1.5 GiB LoRA file is not refused locally',
+    json_decode($t->calls[0]['body'], true) === ['contentType' => 'application/octet-stream', 'bytes' => 1536 * 1024 * 1024]);
+try {
+    (new SpicyClient(transport: new FakeTransport([]), sleeper: $noSleep))
+        ->createUploadUrl(UploadContentType::Lora, 2147483648 + 1);
+    check('a LoRA file over 2 GiB is refused locally', false);
+} catch (SpicyUploadError $e) { check('a LoRA file over 2 GiB is refused locally', $e->status === 413); }
+
+/* -- 17.6 Failure reasons ------------------------------------------------ */
+echo "failure reasons\n";
+
+function reasonEnvelope(int $status, int $code, mixed $data, array $headers = []): HttpResponse
+{
+    return new HttpResponse($status, $headers, json_encode(
+        ['code' => $code, 'msg' => 'refused', 'data' => $data, 'request_id' => 'req_reason'],
+        JSON_THROW_ON_ERROR,
+    ));
+}
+
+/** Run $call against one scripted response and return what it threw. */
+function failureOf(HttpResponse $response, ?callable $call = null): ?SpicyApiError
+{
+    global $noSleep;
+    $client = new SpicyClient(transport: new FakeTransport([$response, $response, $response]), sleeper: $noSleep);
+    try {
+        ($call ?? static fn (SpicyClient $c) => $c->assets->usage())($client);
+    } catch (SpicyApiError $e) {
+        return $e;
+    }
+
+    return null;
+}
+
+$e = failureOf(reasonEnvelope(400, 400, ['reason' => 'asset_library_full']));
+check('data.reason reaches the exception', $e?->reason === 'asset_library_full', (string) $e?->reason);
+check('a known reason maps to its enum case', $e?->assetErrorReason() === AssetErrorReason::LibraryFull);
+check('a known reason drives the guidance', str_contains((string) $e?->guidance(), 'plan is full'), (string) $e?->guidance());
+check('describe() names the reason', str_contains((string) $e?->describe(), 'reason=asset_library_full'), (string) $e?->describe());
+check('the business code survives next to the reason', $e?->businessCode === 400 && $e?->status === 400);
+
+$e = failureOf(reasonEnvelope(403, 403, ['reason' => 'asset_some_future_reason']));
+check('an unknown reason is passed through unchanged', $e?->reason === 'asset_some_future_reason');
+check('an unknown reason maps to no enum case', $e !== null && $e->assetErrorReason() === null);
+check('an unknown reason falls back to code guidance', $e !== null && !str_contains($e->guidance(), 'plan'));
+
+foreach (['absent' => null, 'empty' => ['reason' => ''], 'not a string' => ['reason' => 42], 'a list' => ['x']] as $label => $data) {
+    $e = failureOf(reasonEnvelope(400, 400, $data));
+    check("a reason that is $label reads as null", $e !== null && $e->reason === null);
+}
+$e = failureOf(errorEnvelope(400, 40004, 'change resolution'));
+check('describe() without a reason is unchanged',
+    $e?->describe() === 'change resolution (http=400 code=40004 request_id=req_err)', (string) $e?->describe());
+
+// The daily limit: 429 until 00:00 UTC, far beyond any retry ceiling. It must come back at once with
+// everything the server said, not be slept through.
+$t = new FakeTransport([reasonEnvelope(429, 429, ['reason' => 'asset_daily_limit'], ['retry-after' => '36000']), envelope([])]);
+$client = new SpicyClient(transport: $t, sleeper: $noSleep);
+try { $client->assets->create(source: 'url', url: 'https://example.com/a.png'); check('the daily limit is raised at once', false); }
+catch (SpicyApiError $e) {
+    check('the daily limit is raised at once', count($t->calls) === 1);
+    check('the daily limit keeps its reason and Retry-After',
+        $e->assetErrorReason() === AssetErrorReason::DailyLimit && $e->retryAfterSeconds === 36000.0 && $e->requestId === 'req_reason');
+}
+
+// A Retry-After inside the retry ceiling but longer than the call has left is not slept out into a
+// local timeout either.
+$t = new FakeTransport([reasonEnvelope(503, 503, ['reason' => 'asset_storage_full'], ['retry-after' => '20']), envelope([])]);
+$client = new SpicyClient(transport: $t, sleeper: $noSleep, requestTimeoutSeconds: 5.0);
+try { $client->assets->usage(); check('a Retry-After longer than the budget is raised at once', false); }
+catch (SpicyTimeoutError $e) { check('a Retry-After longer than the budget is raised at once', false, 'a local timeout was raised'); }
+catch (SpicyApiError $e) {
+    check('a Retry-After longer than the budget is raised at once', count($t->calls) === 1);
+    check('that error is the server\'s, reason included', $e->status === 503 && $e->reason === 'asset_storage_full');
+}
+
+// waitForTerminal treats such a poll like one that timed out: it waits as asked and polls again.
+$doneTask = ['taskId' => 't', 'model' => 'm', 'state' => 'succeeded', 'cost' => '0', 'settled' => true, 'createdAt' => 'x'];
+$t = new FakeTransport([errorEnvelope(429, 429, 'slow', ['retry-after' => '3']), envelope($doneTask)]);
+$slept = [];
+$client = new SpicyClient(transport: $t, requestTimeoutSeconds: 2.0,
+    sleeper: static function (float $s) use (&$slept): void { $slept[] = $s; });
+$final = $client->waitForTerminal('t');
+check('a wait survives a Retry-After longer than one poll', $final['state'] === 'succeeded' && count($t->calls) === 2);
+check('the wait honoured that Retry-After', in_array(3.0, $slept, true), json_encode($slept));
+$t = new FakeTransport([errorEnvelope(404, 404, 'not found')]);
+try { (new SpicyClient(transport: $t, sleeper: $noSleep))->waitForTerminal('t'); check('a 404 still ends the wait', false); }
+catch (SpicyTimeoutError $e) { check('a 404 still ends the wait', false, 'it became a timeout'); }
+catch (SpicyApiError $e) { check('a 404 still ends the wait', $e->status === 404 && count($t->calls) === 1); }
+
+/* -- 17.7 Asset library -------------------------------------------------- */
+echo "asset library\n";
+$asset = ['id' => 'ast_1', 'uri' => 'spicy://a/ast_1', 'name' => 'Hero', 'kind' => 'image', 'favorite' => false];
+$api = 'https://api.spicyapi.ai/api/v1';
+
+/** The query parameters of a recorded call, decoded. */
+function queryOf(array $call): array
+{
+    parse_str((string) parse_url($call['url'], PHP_URL_QUERY), $query);
+
+    return $query;
+}
+
+/** Whether $call throws InvalidArgumentException without sending anything. */
+function refusedLocally(callable $call): bool
+{
+    global $noSleep;
+    $t = new FakeTransport([]);
+    try {
+        $result = $call(new SpicyClient(transport: $t, sleeper: $noSleep));
+        if ($result instanceof Generator) { $result->current(); }
+    } catch (InvalidArgumentException) {
+        return $t->calls === [];
+    } catch (Throwable) {
+        return false;
+    }
+
+    return false;
+}
+
+// create: a task output.
+$t = new FakeTransport([envelope($asset)]);
+$client = new SpicyClient(transport: $t, sleeper: $noSleep);
+$saved = $client->assets->create(source: AssetSource::TaskOutput, taskId: ' job_1 ', index: 0, name: 'Hero');
+check('create returns the saved asset', $saved['uri'] === 'spicy://a/ast_1');
+check('create posts to /assets', $t->calls[0]['method'] === 'POST' && $t->calls[0]['url'] === "$api/assets");
+check('create sends exactly the chosen source',
+    json_decode($t->calls[0]['body'], true) === ['source' => 'task_output', 'taskId' => 'job_1', 'index' => 0, 'name' => 'Hero'],
+    (string) $t->calls[0]['body']);
+$sentKey = $t->calls[0]['headers']['Idempotency-Key'] ?? '';
+check('create adds an Idempotency-Key by itself', str_starts_with($sentKey, 'spicy-') && strlen($sentKey) > 20, $sentKey);
+
+// The generated key is the same on every attempt, which is what makes the retry safe.
+$t = new FakeTransport([errorEnvelope(500, 500, 'boom'), errorEnvelope(503, 503, 'busy'), envelope($asset)]);
+$client = new SpicyClient(transport: $t, sleeper: $noSleep);
+$client->assets->create(source: 'task_output', taskId: 'job_1', key: 'out-0');
+check('create is retried', count($t->calls) === 3);
+check('every attempt of one create carries the same key',
+    count(array_unique(array_map(static fn (array $c): string => $c['headers']['Idempotency-Key'] ?? '', $t->calls))) === 1);
+check('an output key is sent as given', json_decode($t->calls[0]['body'], true)['key'] === 'out-0');
+$t = new FakeTransport([envelope($asset), envelope($asset)]);
+$client = new SpicyClient(transport: $t, sleeper: $noSleep);
+$client->assets->create(source: 'url', url: 'https://example.com/a.png');
+$client->assets->create(source: 'url', url: 'https://example.com/a.png');
+check('two separate creates get two different keys',
+    $t->calls[0]['headers']['Idempotency-Key'] !== $t->calls[1]['headers']['Idempotency-Key']);
+check('a url save sends the url', json_decode($t->calls[0]['body'], true) === ['source' => 'url', 'url' => 'https://example.com/a.png']);
+
+// A caller-supplied key replays the same save.
+$t = new FakeTransport([envelope($asset)]);
+(new SpicyClient(transport: $t, sleeper: $noSleep))->assets->create(source: 'upload', fileId: 'spicy://f/fil_9', idempotencyKey: 'save-order-42');
+check('a passed idempotencyKey is used verbatim', ($t->calls[0]['headers']['Idempotency-Key'] ?? '') === 'save-order-42');
+check('an upload save sends the fileId', json_decode($t->calls[0]['body'], true) === ['source' => 'upload', 'fileId' => 'spicy://f/fil_9']);
+
+foreach ([
+    'an unknown source' => static fn (SpicyClient $c) => $c->assets->create(source: 'disk', url: 'x'),
+    'a field of another source' => static fn (SpicyClient $c) => $c->assets->create(source: 'url', url: 'https://e.com/a.png', taskId: 'job_1'),
+    'an upload without fileId' => static fn (SpicyClient $c) => $c->assets->create(source: 'upload'),
+    'a task output without taskId' => static fn (SpicyClient $c) => $c->assets->create(source: 'task_output', index: 0),
+    'a url save without url' => static fn (SpicyClient $c) => $c->assets->create(source: 'url', url: '  '),
+    'a negative index' => static fn (SpicyClient $c) => $c->assets->create(source: 'task_output', taskId: 'job_1', index: -1),
+    'a blank output key' => static fn (SpicyClient $c) => $c->assets->create(source: 'task_output', taskId: 'job_1', key: ' '),
+    'a blank idempotencyKey' => static fn (SpicyClient $c) => $c->assets->create(source: 'url', url: 'https://e.com/a.png', idempotencyKey: ' '),
+    'an idempotencyKey over 128 characters' => static fn (SpicyClient $c) => $c->assets->create(source: 'url', url: 'https://e.com/a.png', idempotencyKey: str_repeat('k', 129)),
+    'an idempotencyKey with a line break' => static fn (SpicyClient $c) => $c->assets->create(source: 'url', url: 'https://e.com/a.png', idempotencyKey: "a\r\nX-Evil: 1"),
+] as $label => $call) {
+    check("create refuses $label before sending", refusedLocally($call));
+}
+
+// list: every filter, as the contract spells it.
+$t = new FakeTransport([envelope(['items' => [$asset]])]);
+$client = new SpicyClient(transport: $t, sleeper: $noSleep);
+$page = $client->assets->list(kind: 'image', source: [AssetSource::TaskOutput, 'upload'], q: 'hero shot', favorite: false,
+    collectionId: 'col_1', entityId: 'ety_1', sort: AssetSort::Name, cursor: 'c1', limit: 10);
+check('list returns the page', $page['items'][0]['id'] === 'ast_1');
+check('list sends every filter', queryOf($t->calls[0]) === ['kind' => 'image', 'source' => 'task_output,upload', 'q' => 'hero shot',
+    'favorite' => 'false', 'collectionId' => 'col_1', 'entityId' => 'ety_1', 'sort' => 'name', 'cursor' => 'c1', 'limit' => '10'],
+    $t->calls[0]['url']);
+check('favorite: false is sent, not dropped', str_contains($t->calls[0]['url'], 'favorite=false'));
+$t = new FakeTransport([envelope(['items' => []]), envelope(['items' => []]), envelope(['items' => []])]);
+$client = new SpicyClient(transport: $t, sleeper: $noSleep);
+$client->assets->list();
+$client->assets->list(favorite: true, sort: 'size', source: 'url');
+$client->assets->list(source: []);
+check('list with no filters sends no query at all', $t->calls[0]['url'] === "$api/assets");
+check('favorite: true and a string sort are sent', queryOf($t->calls[1]) === ['source' => 'url', 'favorite' => 'true', 'sort' => 'size']);
+check('an empty source list leaves the filter off', $t->calls[2]['url'] === "$api/assets");
+check('list sends no Idempotency-Key', !isset($t->calls[0]['headers']['Idempotency-Key']));
+
+foreach ([
+    'a blank q' => static fn (SpicyClient $c) => $c->assets->list(q: ' '),
+    'an empty kind' => static fn (SpicyClient $c) => $c->assets->list(kind: ''),
+    'an unknown sort' => static fn (SpicyClient $c) => $c->assets->list(sort: 'newest'),
+    'an unknown source' => static fn (SpicyClient $c) => $c->assets->list(source: ['upload', 'disk']),
+    'a blank collectionId' => static fn (SpicyClient $c) => $c->assets->list(collectionId: ' '),
+    'a blank entityId' => static fn (SpicyClient $c) => $c->assets->list(entityId: ''),
+    'a blank cursor' => static fn (SpicyClient $c) => $c->assets->list(cursor: ''),
+    'a zero limit' => static fn (SpicyClient $c) => $c->assets->list(limit: 0),
+    'an unknown sort, in iterAll at call time' => static fn (SpicyClient $c) => $c->assets->iterAll(sort: 'bogus'),
+] as $label => $call) {
+    check("list refuses $label before sending", refusedLocally($call));
+}
+
+// iterAll: follows nextCursor and repeats the filters and sort on every page.
+$t = new FakeTransport([
+    envelope(['items' => [['id' => 'ast_1'], ['id' => 'ast_2']], 'nextCursor' => 'p2']),
+    envelope(['items' => [['id' => 'ast_3']], 'nextCursor' => 'p3']),
+    envelope(['items' => [['id' => 'ast_4']]]),
+]);
+$client = new SpicyClient(transport: $t, sleeper: $noSleep);
+$iterator = $client->assets->iterAll(kind: 'video', favorite: true, sort: 'oldest', limit: 2);
+check('iterAll sends nothing until iterated', $t->calls === []);
+$ids = array_map(static fn (array $a): string => $a['id'], iterator_to_array($iterator, false));
+check('iterAll yields every asset across pages', $ids === ['ast_1', 'ast_2', 'ast_3', 'ast_4'], implode(',', $ids));
+check('iterAll stops on the page without nextCursor', $t->drained() && count($t->calls) === 3);
+check('the first page carries no cursor', !array_key_exists('cursor', queryOf($t->calls[0])));
+check('later pages repeat the filters and sort and move only the cursor',
+    queryOf($t->calls[2]) === ['kind' => 'video', 'favorite' => 'true', 'sort' => 'oldest', 'cursor' => 'p3', 'limit' => '2'],
+    $t->calls[2]['url']);
+$t = new FakeTransport([
+    envelope(['items' => [['id' => 'ast_1']], 'nextCursor' => 'same']),
+    envelope(['items' => [['id' => 'ast_2']], 'nextCursor' => 'same']),
+]);
+$client = new SpicyClient(transport: $t, sleeper: $noSleep);
+try { iterator_to_array($client->assets->iterAll(), false); check('a repeated cursor is refused instead of looping', false); }
+catch (SpicyApiError $e) { check('a repeated cursor is refused instead of looping', count($t->calls) === 2 && str_contains($e->getMessage(), 'cursor')); }
+
+// get / update / delete / usage.
+$t = new FakeTransport([envelope($asset), envelope($asset), envelope($asset), envelope($asset)]);
+$client = new SpicyClient(transport: $t, sleeper: $noSleep);
+$client->assets->get('ast_1');
+$client->assets->get(' spicy://a/ast_1 ');
+$client->assets->get('ast_a/b?c');
+$client->assets->update('spicy://a/ast_1', favorite: false);
+check('get reads one asset', $t->calls[0]['method'] === 'GET' && $t->calls[0]['url'] === "$api/assets/ast_1");
+check('get accepts the spicy://a/ reference', $t->calls[1]['url'] === "$api/assets/ast_1");
+check('an asset id is encoded into one path segment', $t->calls[2]['url'] === "$api/assets/ast_a%2Fb%3Fc", $t->calls[2]['url']);
+check('update is a PATCH of only the passed fields',
+    $t->calls[3]['method'] === 'PATCH' && $t->calls[3]['url'] === "$api/assets/ast_1"
+    && json_decode($t->calls[3]['body'], true) === ['favorite' => false], (string) $t->calls[3]['body']);
+$t = new FakeTransport([envelope($asset)]);
+(new SpicyClient(transport: $t, sleeper: $noSleep))->assets->update('ast_1', name: 'Renamed', favorite: true);
+check('update can rename and favorite at once', json_decode($t->calls[0]['body'], true) === ['name' => 'Renamed', 'favorite' => true]);
+check('update sends no Idempotency-Key', !isset($t->calls[0]['headers']['Idempotency-Key']));
+$t = new FakeTransport([errorEnvelope(502, 502, 'bad gateway'), envelope(['id' => 'ast_1', 'deleted' => true])]);
+$deleted = (new SpicyClient(transport: $t, sleeper: $noSleep))->assets->delete('spicy://a/ast_1');
+check('delete is a DELETE with no body', $t->calls[0]['method'] === 'DELETE' && $t->calls[0]['body'] === null
+    && $t->calls[0]['url'] === "$api/assets/ast_1");
+check('delete is retried without an Idempotency-Key', count($t->calls) === 2 && $deleted['deleted'] === true
+    && !isset($t->calls[0]['headers']['Idempotency-Key']));
+$t = new FakeTransport([envelope(['scope' => ['personal' => true, 'canWrite' => true, 'canTopUp' => false], 'createdToday' => 3])]);
+$usage = (new SpicyClient(transport: $t, sleeper: $noSleep))->assets->usage();
+check('usage reads /assets/usage', $t->calls[0]['method'] === 'GET' && $t->calls[0]['url'] === "$api/assets/usage");
+check('usage hands back scope', $usage['scope']['canTopUp'] === false);
+
+foreach ([
+    'an empty asset id' => static fn (SpicyClient $c) => $c->assets->get('  '),
+    'a bare spicy://a/ prefix' => static fn (SpicyClient $c) => $c->assets->get('spicy://a/'),
+    'an asset id with a line break' => static fn (SpicyClient $c) => $c->assets->delete("ast_1\nX-Evil: 1"),
+    'an update with nothing to change' => static fn (SpicyClient $c) => $c->assets->update('ast_1'),
+] as $label => $call) {
+    check("the asset calls refuse $label before sending", refusedLocally($call));
+}
+
+// uploadFile: the three upload steps, then one save of the committed file.
+$tmpDir = sys_get_temp_dir() . '/spicy-assets-' . bin2hex(random_bytes(4));
+mkdir($tmpDir);
+$voice = $tmpDir . '/voice-sample.wav';
+file_put_contents($voice, 'RIFF....WAVE');
+$wavTicket = ['fileId' => 'fil_w', 'key' => 'spicy://f/fil_w', 'uploadUrl' => 'https://storage.example/w?sig=1',
+    'method' => 'PUT', 'headers' => ['Content-Type' => 'audio/wav'], 'expiresAt' => 'x', 'maxBytes' => 94371840];
+$wavCommit = ['fileId' => 'fil_w', 'status' => 'ready', 'uri' => 'spicy://f/fil_w'];
+$t = new FakeTransport([envelope($wavTicket), new HttpResponse(200, [], ''), envelope($wavCommit), envelope($asset)]);
+$client = new SpicyClient(transport: $t, sleeper: $noSleep);
+$saved = $client->assets->uploadFile($voice);
+check('uploadFile uploads, commits and saves', count($t->calls) === 4 && $saved['id'] === 'ast_1');
+check('uploadFile infers the type from the extension', json_decode($t->calls[0]['body'], true)['contentType'] === 'audio/wav');
+check('uploadFile saves the committed file under its base name',
+    json_decode($t->calls[3]['body'], true) === ['source' => 'upload', 'fileId' => 'fil_w', 'name' => 'voice-sample.wav'],
+    (string) $t->calls[3]['body']);
+check('uploadFile saves with an Idempotency-Key', isset($t->calls[3]['headers']['Idempotency-Key']));
+$longName = $tmpDir . '/' . str_repeat("\u{3b1}", 90) . '.png';
+file_put_contents($longName, str_repeat("\x89PNG", 4));
+$t = new FakeTransport([envelope($ticket), new HttpResponse(200, [], ''), envelope($commit), envelope($asset)]);
+(new SpicyClient(transport: $t, sleeper: $noSleep))->assets->uploadFile($longName);
+$cutName = json_decode($t->calls[3]['body'], true)['name'] ?? '';
+check('a long default name is cut to 80 characters, not bytes', $cutName === str_repeat("\u{3b1}", 80), $cutName);
+$t = new FakeTransport([envelope($ticket), new HttpResponse(200, [], ''), envelope($commit), envelope($asset)]);
+(new SpicyClient(transport: $t, sleeper: $noSleep))->assets->uploadFile($longName, name: 'Logo', contentType: UploadContentType::Png);
+check('an explicit name wins', json_decode($t->calls[3]['body'], true)['name'] === 'Logo');
+$t = new FakeTransport([envelope($ticket), new HttpResponse(403, [], '')]);
+try { (new SpicyClient(transport: $t, sleeper: $noSleep))->assets->uploadFile($longName); check('a failed upload saves nothing', false); }
+catch (SpicyUploadError $e) { check('a failed upload saves nothing', count($t->calls) === 2); }
+array_map('unlink', glob($tmpDir . '/*'));
+rmdir($tmpDir);
+
+// Characters: read-only.
+$character = ['id' => 'ety_1', 'kind' => 'character', 'name' => 'Mia', 'assets' => [$asset], 'count' => 1];
+$t = new FakeTransport([envelope(['items' => [$character]]), envelope($character),
+    envelope(['items' => [$character], 'nextCursor' => 'n2']), envelope(['items' => [['id' => 'ety_2']]])]);
+$client = new SpicyClient(transport: $t, sleeper: $noSleep);
+$client->assets->characters->list(assetId: 'spicy://a/ast_1', limit: 5);
+$mia = $client->assets->characters->get('ety_1');
+$all = iterator_to_array($client->assets->characters->iterAll(assetId: 'ast_1'), false);
+check('characters list filters by a normalised asset id',
+    $t->calls[0]['method'] === 'GET' && str_starts_with($t->calls[0]['url'], "$api/assets/entities?")
+    && queryOf($t->calls[0]) === ['assetId' => 'ast_1', 'limit' => '5'], $t->calls[0]['url']);
+check('characters get reads one character', $t->calls[1]['url'] === "$api/assets/entities/ety_1" && $mia['assets'][0]['uri'] === 'spicy://a/ast_1');
+check('characters iterAll follows nextCursor', array_column($all, 'id') === ['ety_1', 'ety_2']
+    && queryOf($t->calls[3]) === ['assetId' => 'ast_1', 'cursor' => 'n2']);
+foreach ([
+    'an empty character id' => static fn (SpicyClient $c) => $c->assets->characters->get(' '),
+    'a zero limit' => static fn (SpicyClient $c) => $c->assets->characters->list(limit: 0),
+    'an empty asset filter' => static fn (SpicyClient $c) => $c->assets->characters->iterAll(assetId: ''),
+] as $label => $call) {
+    check("characters refuse $label before sending", refusedLocally($call));
+}
+check('characters expose no way to write',
+    array_values(array_filter(
+        array_map(static fn (ReflectionMethod $m): string => $m->getName(),
+            (new ReflectionClass(SpicyAssetCharacters::class))->getMethods(ReflectionMethod::IS_PUBLIC)),
+        static fn (string $n): bool => $n !== '__construct',
+    )) === ['list', 'iterAll', 'get']);
+
+// The asset enums must equal the pinned contract's lists; scripts/check_contract.php does the same
+// against the published contract over the network.
+/** The values of the first inline enum found after $anchor and then $field in the pinned contract. */
+function pinnedEnum(string $contract, string $anchor, string $field, int $window = 8000): array
+{
+    $start = strpos($contract, $anchor);
+    if ($start === false) { return []; }
+    $section = substr($contract, $start, $window);
+    $at = strpos($section, $field);
+    if ($at === false || preg_match('/enum:\s*\[([^\]]+)\]/', substr($section, $at, 600), $m) !== 1) { return []; }
+    $values = array_map(static fn (string $v): string => trim(trim($v), "'\""), explode(',', $m[1]));
+    sort($values);
+
+    return $values;
+}
+$enumValues = static function (string $enum): array {
+    $values = array_map(static fn (BackedEnum $case): string => (string) $case->value, $enum::cases());
+    sort($values);
+
+    return $values;
+};
+foreach ([
+    'AssetErrorReason' => [AssetErrorReason::class, '    ErrorEnvelope:', '                reason:'],
+    'AssetSort' => [AssetSort::class, 'operationId: listAssets', 'name: sort'],
+    'AssetSource' => [AssetSource::class, '    AssetCreateRequest:', 'source:'],
+] as $label => [$enum, $anchor, $field]) {
+    $fromContract = pinnedEnum($pinned, $anchor, $field);
+    check("$label equals the pinned contract enum", $fromContract !== [] && $enumValues($enum) === $fromContract,
+        implode(',', $fromContract) . ' | ' . implode(',', $enumValues($enum)));
+}
+check('every asset reason has its own guidance',
+    count(array_unique(array_map(static fn (AssetErrorReason $r): string => $r->guidance(), AssetErrorReason::cases())))
+    === count(AssetErrorReason::cases()));
+
 /* -- 18. The README lines up with the code --------------------------- */
 echo "README\n";
 $readme = (string) file_get_contents(__DIR__ . '/../README.md');
@@ -961,6 +1335,32 @@ check('every exception property the README names really exists',
     'README: ' . implode(',', $namedProperties[1] ?? []) . ' - actual: ' . implode(',', $realProperties));
 foreach ([40003, 40004, 40310, 409, 40901, 503, 50301, 50302] as $documentedCode) {
     check("the README error table lists $documentedCode", str_contains($readme, '| `' . $documentedCode . '` |'));
+}
+// Every asset library call in the README examples and the method table must name a real method and
+// real parameters. Named arguments are checked too: a misspelt one is a fatal error in PHP, but only
+// when that line runs, and nobody runs a README.
+$assetCalls = [];
+preg_match_all('/assets->(characters->)?([A-Za-z]+)\(([^()]*(?:\([^()]*\)[^()]*)*)\)/', $readme, $assetMatches, PREG_SET_ORDER);
+foreach ($assetMatches as [, $onCharacters, $method, $arguments]) {
+    $assetCalls[] = [$onCharacters === '' ? SpicyAssets::class : SpicyAssetCharacters::class, $method, $arguments];
+}
+check('the README shows the asset library at all', count($assetCalls) >= 10, (string) count($assetCalls));
+foreach ($assetCalls as [$class, $method, $arguments]) {
+    $label = basename(str_replace('\\', '/', $class)) . "::$method";
+    if (!method_exists($class, $method)) {
+        check("the README's $label exists", false);
+        continue;
+    }
+    $parameters = array_map(
+        static fn (ReflectionParameter $p): string => $p->getName(),
+        (new ReflectionMethod($class, $method))->getParameters(),
+    );
+    preg_match_all('/(?<![\w$>\'"])([a-zA-Z]+):(?!:)/', $arguments, $named);
+    $unknown = array_diff($named[1], $parameters);
+    check("the README's $label uses real argument names", $unknown === [], implode(',', $unknown) . " not in " . implode(',', $parameters));
+}
+foreach (AssetErrorReason::cases() as $documentedReason) {
+    check("the README names the reason {$documentedReason->value}", str_contains($readme, '`' . $documentedReason->value . '`'));
 }
 
 /* -- 14. Redline scan ------------------------------------------------- */

@@ -36,6 +36,12 @@ tags:
   - name: Models
   - name: Account
   - name: Media
+  - name: Assets
+    description: >-
+      Long-term private asset library. Saved files are kept until you delete them and are referenced as
+      spicy://a/<id> in generation requests made with keys of the same workspace. A personal key reaches your
+      personal library; a team workspace key reaches that team's shared library. Only short private previews
+      are ever returned; there are no public links. Storage unlocks with the account owner's lifetime top-ups.
   - name: OpenAI Compatible
     description: >-
       OpenAI / Anthropic protocol shells under `/v1` and the Google Gemini shell under `/v1beta`.
@@ -270,9 +276,18 @@ paths:
         error or drops the connection, the answer is complete, the stream ends
         with `[DONE]` as usual, and the delivered usage is charged.
 
-        Non-streaming calls to the compatible endpoints get no keep-alive: a
-        response that takes longer than about 100 seconds is cut off by the
-        network edge and is not charged. Use `stream: true` for long reasoning.
+        Non-streaming calls to the compatible endpoints are kept open too. A
+        call that finishes within about 30 seconds is answered exactly as
+        before. A longer one commits a `200` response with
+        `Content-Type: application/json` and the `X-Spicy-Keepalive: 1` header
+        after about 30 seconds, then sends a newline every 15 seconds until the
+        answer is ready; JSON allows leading whitespace, so standard parsers
+        read the body unchanged. Because the status is already sent, a failure
+        after that point arrives as the protocol's own error object in the body
+        of the `200` response, with the same code and message it would
+        otherwise have had, and the hold is still released. The whitespace is
+        not model output: disconnecting after it follows the usual disconnect
+        rules, and an answer that ends up empty or refused is still refunded.
 
         Generation models (image, video, audio) are asynchronous and must use
         `createTask` with `recordInfo` polling; calling this endpoint for them
@@ -657,8 +672,11 @@ paths:
         bytes with PUT and copy every returned header. Supported media types are
         JPEG, PNG, WebP and GIF images (10 MiB), or MP4/WebM video and
         MP3/WAV audio (90 MiB, at most 600 seconds). Audio/video commit verifies
-        format and measurable duration; it does not apply a platform content filter. After PUT,
-        call the file commit endpoint and use its spicy:// URI in task input.
+        format and measurable duration; it does not apply a platform content filter.
+        LoRA weights are uploaded as `application/octet-stream` (a `.safetensors`
+        file, up to 2 GiB; the ticket stays valid for 2 hours); commit checks that it
+        is a complete safetensors file, and the returned URI goes in `loras[].path`.
+        After PUT, call the file commit endpoint and use its spicy:// URI in task input.
       requestBody:
         required: true
         content:
@@ -708,6 +726,39 @@ paths:
         '409': { $ref: '#/components/responses/Conflict' }
         '429': { $ref: '#/components/responses/RateLimited' }
         '500': { $ref: '#/components/responses/ServerError' }
+  /api/v1/files/import:
+    post:
+      tags: [Media]
+      operationId: importLoraFile
+      summary: Import a LoRA weights file from a link
+      description: |
+        Downloads a `.safetensors` LoRA file once and stores it as your upload, so a
+        file that needs a sign-in can still be used without making it public. `url`
+        accepts a Hugging Face repo id (`owner/repo`, when the repo has exactly one
+        `.safetensors` file), a Hugging Face repo or file page, or any direct https
+        link. `token` is optional: a Hugging Face access token, or a Civitai API key,
+        used only for this download and never stored. The response matches the
+        commit endpoint; put its spicy:// URI in `loras[].path`. Imported files are
+        kept for the same time as other uploads. Public links can also be passed to
+        `loras[].path` directly, without importing.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoraImportRequest'
+      responses:
+        '200':
+          description: Ready tenant-scoped file reference.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FileCommitEnvelope' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/ServerError' }
+        '503': { $ref: '#/components/responses/Unavailable' }
   /api/v1/common/download-url:
     post:
       tags: [Media]
@@ -737,6 +788,294 @@ paths:
         '413': { $ref: '#/components/responses/PayloadTooLarge' }
         '429': { $ref: '#/components/responses/RateLimited' }
         '500': { $ref: '#/components/responses/ServerError' }
+  # ── Asset library (long-term private assets) ──────────────────────────
+  /api/v1/assets:
+    get:
+      tags: [Assets]
+      operationId: listAssets
+      summary: List your saved assets
+      description: |
+        Returns the ready assets of the key's library, one page at a time. Pass
+        the previous page's `nextCursor` as `cursor` to continue; it is absent on
+        the last page, and a cursor only works with the `sort` it came from.
+        Filter with `kind`, `source` (comma-separated), `favorite`, `collectionId`
+        (one collection of the key's library; collections are created and edited in
+        the console, and an id outside this library returns 404), `entityId` (the
+        images of one character) and a case-insensitive name search in `q`.
+        Order with `sort`: `recent` (default, newest first), `oldest`, `name`
+        (case-insensitive A to Z) or `size` (largest first).
+
+        Every item carries a stable `uri` (`spicy://a/<id>`) and a private
+        `previewUrl` signed for at most 20 minutes. The `uri` works only in
+        generation requests made with keys of the same workspace (any media field
+        of a model input); nothing in this API returns a permanent or publicly
+        reachable link, so the asset library cannot be used as file hosting.
+        Responses are `private, no-store`. Listing and reading assets is limited
+        to 60 requests per minute per account.
+
+        The key decides the library: a key created in your personal workspace
+        reaches your personal library, and a key created in a team workspace
+        (by any member) reaches that team's shared library. A team key never
+        reaches anyone's personal library. What a team key may change follows
+        the current role of the member who created it: owner and admin can save,
+        rename and delete anything; developer can save and rename or delete only
+        what they saved; billing and readonly can only read and use assets. If
+        that member has left the team the key gets 403 with `data.reason`
+        `asset_workspace_forbidden`.
+      parameters:
+        - { name: kind, in: query, required: false, schema: { type: string, enum: [image, video, audio] } }
+        - { name: source, in: query, required: false, description: 'Comma-separated list of task_output, upload and url.', schema: { type: string } }
+        - { name: q, in: query, required: false, description: Case-insensitive substring of the asset name., schema: { type: string, maxLength: 80 } }
+        - { name: favorite, in: query, required: false, description: Only favorites (true) or only assets that are not favorites (false)., schema: { type: boolean } }
+        - { name: collectionId, in: query, required: false, description: Only assets in this collection of the same library (404 when it is not one)., schema: { type: string, maxLength: 40 } }
+        - { name: entityId, in: query, required: false, description: Only the images of this character in the same library; an unknown id returns an empty page., schema: { type: string, maxLength: 40 } }
+        - { name: sort, in: query, required: false, schema: { type: string, enum: [recent, oldest, name, size], default: recent } }
+        - { name: cursor, in: query, required: false, schema: { type: string } }
+        - { name: limit, in: query, required: false, schema: { type: integer, minimum: 1, maximum: 100, default: 100 } }
+      responses:
+        '200':
+          description: One page of assets.
+          headers:
+            Cache-Control:
+              schema: { type: string, const: 'private, no-store' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AssetListEnvelope' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/ServerError' }
+    post:
+      tags: [Assets]
+      operationId: createAsset
+      summary: Save a file to your asset library
+      description: |
+        Copies a file into the key's library (your personal library, or the
+        team's shared library for a team key), where it is kept until it is
+        deleted, the owner closes the account or the team is deleted. Choose one
+        source:
+
+        - `source: task_output` with `taskId` and either the output `key` or its
+          zero-based `index` (the order of `output.assets` in `recordInfo`). The
+          task must be one of your own successful tasks; with a team key, a task
+          of that team.
+        - `source: upload` with the `fileId` of a committed upload.
+        - `source: url` with a public `http` or `https` address on port 80 or 443,
+          without a username or password. The whole file is downloaded once
+          through a fetcher that refuses private and internal addresses, and its
+          type is read from the file itself: only JPEG, PNG, WebP and GIF images,
+          MP4 and WebM video, and MP3, WAV, FLAC and Ogg audio are accepted.
+          Links to SpicyAPI storage are refused; save those with `task_output` or
+          `upload` instead.
+
+        `Idempotency-Key` is required and bound to the request for 24 hours.
+        Saving the same source again returns the existing asset without using
+        more space. Dimensions and durations are measured by the server.
+
+        Storage unlocks with the owner's lifetime top-ups (see
+        `GET /api/v1/assets/usage`); the owner's personal library and all of
+        their team libraries share one allowance. Without any top-up, saving
+        returns 400 (`data.reason` `asset_library_locked`) explaining how much to
+        top up. A full allowance (`asset_library_full`) or a file above the
+        plan's per-file limit (`asset_file_too_large`) also returns 400 naming the
+        plan and what the next plan unlocks; for team members who cannot top up,
+        the message asks the team owner to upgrade instead of naming an amount.
+        Lowering a plan never deletes saved assets. Saving is limited to 30
+        requests per minute and a daily number of new assets per allowance (429
+        with `Retry-After` until 00:00 UTC, `asset_daily_limit`). If storage is
+        full across the platform the request returns 503 (`asset_storage_full`).
+        A team role that cannot save gets 403 (`asset_permission_denied`).
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema: { type: string, minLength: 1, maxLength: 128 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AssetCreateRequest' }
+      responses:
+        '200':
+          description: The saved (or already saved) asset.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AssetEnvelope' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/ServerError' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+  /api/v1/assets/usage:
+    get:
+      tags: [Assets]
+      operationId: getAssetUsage
+      summary: Get your asset library plan, usage and limits
+      description: |
+        Plans unlock automatically with the owner's lifetime top-ups and never
+        go down. Returns the current plan, how much is stored, its limits, the
+        next plan and how much more to top up to reach it, the full plan table,
+        and how many assets were created today against the daily limit. Usage
+        and limits cover the owner's whole allowance: the personal library plus
+        every team library they own. A plan with all limits at 0 cannot save new
+        assets; assets already saved stay usable. Byte values use binary units
+        (500 MB = 524288000 bytes).
+
+        `scope` tells which library the key reaches and what it may do there.
+        When `scope.canTopUp` is false (a team key whose creator is not the
+        team owner, billing members included), `lifetimeTopupUsd` and
+        `topupToNextTierUsd` are omitted.
+      responses:
+        '200':
+          description: Plan, usage and limits.
+          headers:
+            Cache-Control:
+              schema: { type: string, const: 'private, no-store' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AssetQuotaEnvelope' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/ServerError' }
+  /api/v1/assets/{assetId}:
+    parameters:
+      - { name: assetId, in: path, required: true, schema: { type: string, pattern: '^ast_' } }
+    get:
+      tags: [Assets]
+      operationId: getAsset
+      summary: Get one asset with a fresh private preview
+      description: The `previewUrl` is signed for at most 20 minutes; persist `uri`, not the preview. An unknown asset, another account's asset and an asset in a library this key does not reach return the same 404.
+      responses:
+        '200':
+          description: The asset.
+          headers:
+            Cache-Control:
+              schema: { type: string, const: 'private, no-store' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AssetEnvelope' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+    patch:
+      tags: [Assets]
+      operationId: renameAsset
+      summary: Rename an asset or mark it as a favorite
+      description: Send `name`, `favorite` or both; only what you send changes, and a body with neither is rejected as an invalid name. The `uri` stays the same and nothing is copied. Favorites belong to the library, so everyone in a team sees the same ones. Repeating the same request is safe, so no Idempotency-Key is needed. In a team library, billing and readonly members cannot rename or change favorites, and developers can do so only for assets they saved (403, `data.reason` `asset_permission_denied`).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                name: { type: string, minLength: 1, maxLength: 80 }
+                favorite: { type: boolean }
+      responses:
+        '200':
+          description: The renamed asset.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AssetEnvelope' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+    delete:
+      tags: [Assets]
+      operationId: deleteAsset
+      summary: Delete an asset
+      description: |
+        The asset disappears immediately (it is also removed from every
+        collection) and its `uri` stops working in new requests; the stored file
+        is then deleted. Deleting an unknown or
+        already deleted asset, or one in a library this key does not reach,
+        returns the same result, so retries are safe and no Idempotency-Key is
+        needed. Deleting does not reset the daily limit on new assets. In a team
+        library, billing and readonly members cannot delete, and developers can
+        delete only assets they saved (403, `data.reason`
+        `asset_permission_denied`).
+      responses:
+        '200':
+          description: Deleted.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AssetDeletedEnvelope' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/ServerError' }
+  /api/v1/assets/entities:
+    get:
+      tags: [Assets]
+      operationId: listAssetCharacters
+      summary: List the characters in your asset library
+      description: |
+        A character is a named set of images saved in the same library, kept in
+        the order arranged in the console. It references those assets instead of
+        copying them: deleting a character never deletes its images, and deleting
+        an image removes it from every character. Characters are created and
+        edited in the console; this API only reads them.
+
+        The key decides the library exactly as for `GET /api/v1/assets`. Each
+        image is an asset with its stable `uri` (`spicy://a/<id>`), usable in
+        generation requests made with keys of the same workspace, and a private
+        `previewUrl` signed for at most 20 minutes. `cover` is the cover image
+        (null while the character has no images).
+
+        Newest first, one page at a time: pass the previous page's `nextCursor`
+        as `cursor`. Pass `assetId` to list only the characters that contain that
+        asset. Responses are `private, no-store`; reading characters shares the
+        limit of 60 requests per minute per account with reading assets.
+      parameters:
+        - { name: kind, in: query, required: false, description: 'Only character exists today; omitting it means character.', schema: { type: string, enum: [character] } }
+        - { name: assetId, in: query, required: false, description: Only characters that contain this asset., schema: { type: string, maxLength: 40 } }
+        - { name: cursor, in: query, required: false, schema: { type: string } }
+        - { name: limit, in: query, required: false, schema: { type: integer, minimum: 1, maximum: 100, default: 50 } }
+      responses:
+        '200':
+          description: One page of characters.
+          headers:
+            Cache-Control:
+              schema: { type: string, const: 'private, no-store' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AssetEntityListEnvelope' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/ServerError' }
+  /api/v1/assets/entities/{entityId}:
+    parameters:
+      - { name: entityId, in: path, required: true, schema: { type: string, maxLength: 40 } }
+    get:
+      tags: [Assets]
+      operationId: getAssetCharacter
+      summary: Get one character with its images in order
+      description: An unknown character, another account's character and one in a library this key does not reach return the same 404. Each image carries a fresh private `previewUrl`; persist the `uri` values, not the previews.
+      responses:
+        '200':
+          description: The character.
+          headers:
+            Cache-Control:
+              schema: { type: string, const: 'private, no-store' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AssetEntityEnvelope' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/RateLimited' }
   # ── OpenAI / Anthropic compatible surface ──────────────────────────────
   # These operations use the response shapes of the external protocols they
   # imitate (OpenAI error objects, Anthropic error objects, SSE event streams)
@@ -790,9 +1129,23 @@ paths:
         when the model declares them (each model page lists its own set);
         `stream`,
         `stream_options`, `user`, `metadata` and `store` are handled by this
-        layer. Any other parameter is forwarded to the model's input schema
-        and rejected with `400` when the model does not declare it — a
-        parameter is never dropped silently.
+        layer. Pure sampling parameters the model does not declare
+        (`temperature`, `top_p`, `top_k`, `min_p`, `top_a`,
+        `frequency_penalty`, `presence_penalty`, `repetition_penalty`), `n: 1`,
+        an empty `stop`, `stop` on a model without stop sequences,
+        `reasoning_effort` on a model without reasoning levels, and an
+        OpenRouter-style `reasoning` object that cannot be translated are
+        ignored, and the response lists them in the `X-Spicy-Ignored-Params`
+        header. Values the model declares but cannot take as sent are changed
+        to the nearest accepted value and listed as `name=value` in the
+        `X-Spicy-Adjusted-Params` header: a sampling value outside the model's
+        range is clamped to the bound, a `stop` list longer than the model
+        allows keeps its first entries, a `reasoning_effort` level the model
+        does not offer becomes the nearest level it does (the lower one on a
+        tie), and `reasoning.effort` (or `reasoning.enabled: false`, as
+        `none`) becomes `reasoning_effort`. Any other parameter is forwarded to
+        the model's input schema and rejected with `400` when the model does
+        not declare it.
 
         `stream: true` returns a Server-Sent Events stream of
         `chat.completion.chunk` objects terminated by `data: [DONE]`. Every
@@ -805,6 +1158,15 @@ paths:
         `usage`. The same hold, settlement and refund rules as
         `/api/v1/jobs/stream` apply; the `X-Spicy-Task-Id` response header names
         the task that holds the charge.
+
+        A non-streaming call that is still running after about 30 seconds is
+        kept open: the `200` status and the `X-Spicy-Keepalive: 1` header go out
+        first, followed by a newline every 15 seconds and then the JSON body.
+        A failure after that point is the usual `{"error": {...}}` object in the
+        body of that `200` response, so check for an `error` key when the
+        header is present. The same applies to `/v1/responses`, `/v1/messages`
+        (Anthropic error object) and `:generateContent` (Gemini error object,
+        whose `error.code` keeps the HTTP status the error would have had).
 
         Errors a client can act on: an unknown `model` returns `404` with
         `code: model_not_found`, the ID shape (`publisher/model/chat`) and the
@@ -826,6 +1188,7 @@ paths:
           description: One `chat.completion` object, or an SSE stream when `stream` is true.
           headers:
             X-Spicy-Task-Id: { $ref: '#/components/headers/SpicyTaskId' }
+            X-Spicy-Keepalive: { $ref: '#/components/headers/SpicyKeepalive' }
           content:
             application/json:
               schema:
@@ -856,6 +1219,11 @@ paths:
         `text.format`, `reasoning.effort` and `stream`. The request is
         translated to a chat completion internally. `previous_response_id`
         is rejected with `400`; send the full history in `input` instead.
+        As on Chat Completions, sampling parameters the model does not
+        declare are ignored and listed in the `X-Spicy-Ignored-Params`
+        response header, and values outside the model's range or levels are
+        changed to the nearest accepted value and listed in
+        `X-Spicy-Adjusted-Params`.
 
         Non-streaming calls return a `response` object with `output[]`
         (`message` and `function_call` items) and `usage`. Streaming calls
@@ -874,6 +1242,7 @@ paths:
           description: One `response` object, or an SSE stream when `stream` is true.
           headers:
             X-Spicy-Task-Id: { $ref: '#/components/headers/SpicyTaskId' }
+            X-Spicy-Keepalive: { $ref: '#/components/headers/SpicyKeepalive' }
           content:
             application/json:
               schema:
@@ -923,6 +1292,7 @@ paths:
           description: One Anthropic `message` object, or an SSE stream when `stream` is true.
           headers:
             X-Spicy-Task-Id: { $ref: '#/components/headers/SpicyTaskId' }
+            X-Spicy-Keepalive: { $ref: '#/components/headers/SpicyKeepalive' }
           content:
             application/json:
               schema:
@@ -956,7 +1326,11 @@ paths:
         `google/gemini-3-flash-preview`). Validation, pricing and availability are
         identical to `/v1/chat/completions`. The response is one
         `GenerateContentResponse`. Errors use the Google
-        `{error:{code,message,status}}` shape.
+        `{error:{code,message,status}}` shape. A call still running after about
+        30 seconds is kept open with leading whitespace and the
+        `X-Spicy-Keepalive: 1` header, as described on
+        `/v1/chat/completions`; a failure after that point is the same error
+        object inside a `200` response.
       parameters:
         - name: model
           in: path
@@ -974,6 +1348,7 @@ paths:
           description: One `GenerateContentResponse`.
           headers:
             X-Spicy-Task-Id: { $ref: '#/components/headers/SpicyTaskId' }
+            X-Spicy-Keepalive: { $ref: '#/components/headers/SpicyKeepalive' }
           content:
             application/json:
               schema:
@@ -1187,6 +1562,14 @@ components:
         Absent when the request was rejected before a task was created (for example a validation error), and on
         a streamed response whose headers were already flushed by a keep-alive before acceptance.
       schema: { type: string }
+    SpicyKeepalive:
+      description: >-
+        Present, with the value `1`, only on a non-streaming text response that was still running after about
+        30 seconds. The `200` status was sent early to keep the connection open, the body starts with whitespace
+        (newlines sent every 15 seconds), and then comes the JSON answer — or, if the request failed after that
+        point, the protocol's own error object with the code and message it would otherwise have had. Absent on
+        responses that finished sooner, which are unchanged.
+      schema: { type: string, enum: ['1'] }
     RateLimitLimit:
       description: Capacity of the active account-level rate-limit window.
       schema: { type: integer }
@@ -1332,6 +1715,23 @@ components:
             msg:
               type: string
               description: Human-readable explanation, English unless `Accept-Language` or the account's API error language selects another supported language. Never parse it; branch on `code`.
+            data:
+              type: object
+              description: >-
+                Present only when the failure carries a machine-readable reason; otherwise absent. `code`, the
+                HTTP status and `msg` are the same with or without it. `asset_library_locked` (400): the asset
+                library opens after the first top-up. `asset_library_full` (400): the allowance is full.
+                `asset_file_too_large` (400): the file is above the plan's per-file limit.
+                `asset_daily_limit` (429): the daily number of new assets is reached; honour `Retry-After`.
+                `asset_storage_full` (503): storage is full across the platform. `asset_permission_denied`
+                (403): the caller's team role does not allow this change. `asset_workspace_forbidden` (403):
+                this key or workspace cannot reach that library. New values may be added; treat unknown values
+                like an absent reason.
+              required: [reason]
+              properties:
+                reason:
+                  type: string
+                  enum: [asset_library_locked, asset_library_full, asset_file_too_large, asset_daily_limit, asset_storage_full, asset_permission_denied, asset_workspace_forbidden, asset_entity_name_taken]
     CreateTaskRequest:
       type: object
       required: [model, input]
@@ -1345,10 +1745,15 @@ components:
           type: object
           description: >-
             Validated against the selected model's inputSchema. Declared image fields accept
-            public HTTPS URLs, committed spicy:// file URIs, your own persona images as
-            spicy://p/<assetId> (created in the console; usable only with API keys you created in
-            your personal workspace, so team workspace keys, another account's id and an unknown id
-            all get the same rejection, and persona images are refused in video, audio and file fields),
+            public HTTPS URLs, committed spicy:// file URIs, legacy persona image references
+            spicy://p/<id> (personas became characters in your personal asset library on 2026-10-12;
+            these references keep resolving to the same images, only in your personal library and only
+            with API keys you created in your personal workspace, so team workspace keys, another
+            account's id and an unknown id all get the same rejection, and they are refused in video,
+            audio and file fields),
+            saved assets as spicy://a/<id> in the media field of the matching kind (the asset must be in
+            the library of the key's workspace: a personal key uses your personal library, a team key uses
+            that team's library; any other asset gets the same rejection as an unknown id),
             or standard Base64 Data URIs
             (image/jpeg, image/png, image/webp, image/gif). Inline images are limited to
             1048576 decoded bytes and 8388608 pixels each, 8192 pixels per side, and
@@ -1363,6 +1768,12 @@ components:
             seed keeps runs comparable, it does not guarantee an identical result). On the few
             models that cannot honour `seed` on every request, we still vary it where it applies
             but do not echo it. A `seed` you send yourself is always used as given.
+            Models that offer an economy route declare the boolean `official_fallback` (default
+            `true`): the request runs on the economy route first and, if that fails and the field is
+            `true`, is retried once on the official route. The hold is the highest price the request
+            can be billed at (the official price while the fallback is allowed); you are billed the
+            price of the route that actually produced the result and the rest of the hold is released.
+            With `false`, only the economy route is tried and the hold is the economy price.
           additionalProperties: true
         callBackUrl:
           type: string
@@ -1394,6 +1805,20 @@ components:
         quantity: { type: string, description: Estimated billable quantity. }
         unit: { type: string }
         expiresAt: { type: string, format: date-time }
+        expectedCharge:
+          allOf:
+            - $ref: '#/components/schemas/USDString'
+          description: >-
+            Present only for models with an economy route (`official_fallback`). What you are charged
+            when the economy route produces the result. `estimatedCost` and `maxCharge` remain the
+            amount held, which is the most you can be charged with the official fallback allowed.
+        billingRoutes:
+          type: array
+          items: { type: string, enum: [economy, official] }
+          description: >-
+            Present only for models with an economy route. The routes this request can be billed at,
+            economy first. `[economy]` when `official_fallback` is `false`; `[official]` when the
+            request uses an option only the official route supports.
     TaskQuoteEnvelope:
       allOf:
         - $ref: '#/components/schemas/EnvelopeBase'
@@ -1548,7 +1973,15 @@ components:
         height: { type: integer }
         durationSeconds: { type: number }
         bytes: { type: integer, format: int64 }
-        role: { type: string }
+        role:
+          type: string
+          description: >-
+            What the asset is: `video`, `image`, `audio` or a model-specific role. Video extend endpoints that join the
+            source clip to the new footage return two assets in a fixed order: the joined clip first (`video`), then the
+            newly generated part on its own (`segment`). Endpoints that return only the new part have no `segment` asset.
+            Video translation endpoints return the dubbed clip (`video`) followed by a subtitle file of the translated
+            speech (`subtitle`, `mime` `application/x-subrip`, an `.srt` file); the subtitle is kept for the same
+            retention period as the video.
         nsfw: { type: boolean }
         pending: { type: boolean }
         unavailable: { type: boolean }
@@ -1609,6 +2042,16 @@ components:
         settled:
           type: boolean
           description: When false, `cost` is the held estimate. When true, `cost` is the final charge. On success the final charge is capped at that hold; unused funds are released. Failed or expired tasks normally release the hold in full; the one exception is a `content_rejected` task on a model whose page states that such refusals are billed, which is settled at the accepted estimate.
+        billingRoute:
+          type: string
+          enum: [economy, official]
+          description: >-
+            Present only for models with an economy route, once billing settled a charge for the task:
+            every succeeded task (even when the final charge is zero) and a `content_rejected` task
+            settled at the accepted estimate under the model's stated refusal billing. `economy`: the
+            economy route ran it and the economy price applied. `official`: the official fallback ran
+            it and the official price applied. Omitted while unsettled, for tasks whose hold was
+            released in full (failed, expired) and for every other model.
         createdAt: { type: string, format: date-time }
         deadlineAt: { type: string, format: date-time, description: Server execution deadline. Present in current responses; historical stored webhook events may omit it. Not the result retention or URL expiry time. }
         completedAt: { type: string, format: date-time }
@@ -1800,6 +2243,13 @@ components:
         offerPercent: { type: string }
         offerEndsAt: { type: string, format: date-time }
         currency: { type: string, const: USD }
+        officialFallbackPrice:
+          allOf:
+            - $ref: '#/components/schemas/USDString'
+          description: >-
+            Present only for models with an economy route. `price` is then the economy-route price and
+            this is the same tier's official price: the most a request is charged when `official_fallback`
+            is `true` and the economy route fails.
     APIModel:
       type: object
       required: [model, family, displayName, provider, modality, tasks, async, mature, policyTier, taskTimeoutSeconds, enabled, available, quantityField, pricing, version, availability, badges, relatedModels, updatedAt]
@@ -1827,7 +2277,8 @@ components:
             `text-to-image`, `text-to-video`, `image-to-video`, `reference-to-video`, `video-edit`,
             `video-extend`, `video-analyze`, `character-animation`, `talking-avatar`, `lip-sync`,
             `video-to-audio` (returns the same video with a generated sound track), `frame-interpolation`
-            (returns the same video at twice its frame rate, same length and audio), `layer-decomposition` (returns a base
+            (returns the same video at twice its frame rate, same length and audio), `video-translate` (returns the
+            same video dubbed into another language, plus a subtitle file as a `subtitle` asset), `layer-decomposition` (returns a base
             image plus transparent layers, see `TaskOutputAsset.layer`), `speech-to-text`, `chat`. New values
             appear as models are added, so treat the set as open.
         async: { type: boolean }
@@ -1871,8 +2322,9 @@ components:
             JSON Schema draft 2020-12 used by `createTask.input` validation and Playground rendering.
             Standard JSON Schema keywords validate. Presentation hints live only in a per-property `x-ui`
             object whose keys are snake_case and drawn from a closed set: `widget`, `order`, `label`,
-            `placeholder`, `rows`, `step`, `unit`, `accept`, `max_size_mb`, `advanced`, `primary`,
-            `affects_price`, `visible_when`, `enum_labels`. `x-ui.order` is the only source of field
+            `placeholder`, `rows`, `step`, `unit`, `accept`, `max_size_mb`, `max_duration_seconds`,
+            `max_total_duration_seconds`, `advanced`, `primary`, `affects_price`, `visible_when`, `enum_labels`,
+            `reference_tokens`, `reference_sequence`, `reference_regions`, `mask`. `x-ui.order` is the only source of field
             order (descending first). `x-ui.widget` is one of `textarea`, `text`, `upload`,
             `multi-upload`, `select`, `radio`, `slider`, `number`, `switch`, `json`, `object-list`,
             `chat-messages`, `hidden`. Root-level composition is limited to `anyOf`, where every branch
@@ -2055,8 +2507,8 @@ components:
       required: [contentType, bytes]
       additionalProperties: false
       properties:
-        contentType: { type: string, enum: [image/jpeg, image/png, image/webp, image/gif, video/mp4, video/webm, audio/mpeg, audio/wav, application/pdf, application/msword, application/vnd.openxmlformats-officedocument.wordprocessingml.document, application/vnd.ms-excel, application/vnd.openxmlformats-officedocument.spreadsheetml.sheet, application/vnd.ms-powerpoint, application/vnd.openxmlformats-officedocument.presentationml.presentation, application/vnd.apple.keynote, application/vnd.apple.pages, application/vnd.apple.numbers, text/plain, text/markdown] }
-        bytes: { type: integer, minimum: 1, maximum: 94371840, description: Images are limited to 10 MiB; supported audio/video to 90 MiB. }
+        contentType: { type: string, enum: [image/jpeg, image/png, image/webp, image/gif, video/mp4, video/webm, audio/mpeg, audio/wav, application/pdf, application/msword, application/vnd.openxmlformats-officedocument.wordprocessingml.document, application/vnd.ms-excel, application/vnd.openxmlformats-officedocument.spreadsheetml.sheet, application/vnd.ms-powerpoint, application/vnd.openxmlformats-officedocument.presentationml.presentation, application/vnd.apple.keynote, application/vnd.apple.pages, application/vnd.apple.numbers, text/plain, text/markdown, application/octet-stream] }
+        bytes: { type: integer, minimum: 1, maximum: 2147483648, description: 'Images are limited to 10 MiB; supported audio/video and documents to 90 MiB; LoRA weights (application/octet-stream, a .safetensors file) to 2 GiB.' }
     UploadURLResponse:
       type: object
       required: [fileId, key, uploadUrl, method, headers, expiresAt, maxBytes]
@@ -2100,6 +2552,13 @@ components:
             code: { type: integer, const: 200 }
             msg: { type: string, const: success }
             data: { $ref: '#/components/schemas/FileCommitResponse' }
+    LoraImportRequest:
+      type: object
+      required: [url]
+      additionalProperties: false
+      properties:
+        url: { type: string, minLength: 1, maxLength: 2048, description: 'Hugging Face repo id (owner/repo), a Hugging Face repo or file page, or a direct https link to a .safetensors file.' }
+        token: { type: string, maxLength: 512, description: 'Optional Hugging Face access token or Civitai API key, used only for this download and never stored.' }
     DownloadURLRequest:
       type: object
       required: [taskId]
@@ -2123,6 +2582,179 @@ components:
             code: { type: integer, const: 200 }
             msg: { type: string, const: success }
             data: { $ref: '#/components/schemas/DownloadURLResponse' }
+    AssetCreateRequest:
+      type: object
+      additionalProperties: false
+      required: [source]
+      properties:
+        source: { type: string, enum: [task_output, upload, url] }
+        taskId: { type: string, description: 'source=task_output: one of your own successful tasks.' }
+        key: { type: string, description: 'source=task_output: the output key. Send key or index.' }
+        index: { type: integer, minimum: 0, description: 'source=task_output: zero-based position in output.assets. Send key or index.' }
+        fileId: { type: string, description: 'source=upload: a committed upload (fil_… or spicy://f/fil_…).' }
+        url: { type: string, maxLength: 2048, description: 'source=url: a public http or https address on port 80 or 443, without credentials.' }
+        name: { type: string, maxLength: 80, description: 'Defaults to "Saved asset".' }
+    Asset:
+      type: object
+      required: [id, uri, name, kind, contentType, bytes, source, sourceId, createdAt, updatedAt, previewUrl, favorite, model, modelName]
+      properties:
+        id: { type: string, pattern: '^ast_' }
+        uri: { type: string, pattern: '^spicy://a/ast_', description: Stable reference. Works only in generation requests made with keys of the same workspace; it is never a downloadable link. }
+        name: { type: string, maxLength: 80 }
+        kind: { type: string, enum: [image, video, audio] }
+        contentType: { type: string }
+        bytes: { type: integer, minimum: 1 }
+        width: { type: integer, minimum: 1 }
+        height: { type: integer, minimum: 1 }
+        durationSeconds: { type: number, exclusiveMinimum: 0 }
+        source: { type: string, enum: [task_output, upload, url] }
+        sourceId: { type: string, description: 'Your task or upload id; for url, an opaque digest of the address (the address itself is not stored).' }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+        previewUrl: { type: string, description: 'Private preview signed for you for at most 20 minutes; empty when signing fails. Do not store or share it — persist uri instead.' }
+        previewUrlExpiresAt: { type: string, format: date-time }
+        favorite: { type: boolean, description: Favorite mark of the library (shared by everyone in a team). }
+        model: { type: string, description: 'Public name of the model that generated the asset, for example bytedance/seedream-5.0-pro/text-to-image; empty for uploads and links.' }
+        modelName: { type: string, description: Display name of that model; empty when the asset was not generated or the name is unknown. }
+    AssetEnvelope:
+      allOf:
+        - $ref: '#/components/schemas/EnvelopeBase'
+        - type: object
+          required: [data]
+          properties:
+            code: { type: integer, const: 200 }
+            msg: { type: string, const: success }
+            data: { $ref: '#/components/schemas/Asset' }
+    AssetEntity:
+      type: object
+      required: [id, kind, name, note, coverAssetId, cover, assets, count, createdAt, updatedAt]
+      properties:
+        id: { type: string }
+        kind: { type: string, enum: [character] }
+        name: { type: string, minLength: 1, maxLength: 40, description: Unique within the library and kind (case-insensitive). }
+        note: { type: string, maxLength: 280 }
+        coverAssetId: { type: string, description: Empty while the character has no images. }
+        cover:
+          oneOf:
+            - $ref: '#/components/schemas/Asset'
+            - type: 'null'
+        assets: { type: array, maxItems: 100, items: { $ref: '#/components/schemas/Asset' }, description: The character's images in order. }
+        count: { type: integer, minimum: 0, maximum: 100 }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+    AssetEntityEnvelope:
+      allOf:
+        - $ref: '#/components/schemas/EnvelopeBase'
+        - type: object
+          required: [data]
+          properties:
+            code: { type: integer, const: 200 }
+            msg: { type: string, const: success }
+            data: { $ref: '#/components/schemas/AssetEntity' }
+    AssetEntityListEnvelope:
+      allOf:
+        - $ref: '#/components/schemas/EnvelopeBase'
+        - type: object
+          required: [data]
+          properties:
+            code: { type: integer, const: 200 }
+            msg: { type: string, const: success }
+            data:
+              type: object
+              required: [items]
+              properties:
+                items: { type: array, items: { $ref: '#/components/schemas/AssetEntity' } }
+                nextCursor: { type: string, description: Absent on the last page. }
+    AssetList:
+      type: object
+      required: [items]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/Asset' } }
+        nextCursor: { type: string, description: Absent on the last page. }
+    AssetListEnvelope:
+      allOf:
+        - $ref: '#/components/schemas/EnvelopeBase'
+        - type: object
+          required: [data]
+          properties:
+            code: { type: integer, const: 200 }
+            msg: { type: string, const: success }
+            data: { $ref: '#/components/schemas/AssetList' }
+    AssetPlan:
+      type: object
+      required: [id, name, minTopupUsd, maxBytes, maxCount, maxFileBytes]
+      properties:
+        id: { type: string, description: 'Lowercase plan key, for example free, plus, pro, studio, max.' }
+        name: { type: string, description: 'Plan name, for example Free, Plus, Pro, Studio or Max.' }
+        minTopupUsd: { type: string, description: Lifetime top-ups in USD that unlock this plan. }
+        maxBytes: { type: integer, minimum: 0, description: 'Total storage in bytes (binary units). 0 means saving is closed on this plan.' }
+        maxCount: { type: integer, minimum: 0 }
+        maxFileBytes: { type: integer, minimum: 0 }
+    AssetScope:
+      type: object
+      required: [workspaceId, personal, role, canWrite, canTopUp]
+      properties:
+        workspaceId: { type: string, description: 'The workspace whose library this is: your personal workspace, or the team. Empty for an account that has no personal workspace yet.' }
+        personal: { type: boolean }
+        role: { type: string, enum: [owner, admin, developer, billing, readonly], description: 'Always owner for a personal library. For a team key, the current role of the member who created it.' }
+        canWrite: { type: boolean, description: 'Whether new assets can be saved here (owner, admin and developer).' }
+        canTopUp: { type: boolean, description: 'Whether the caller can see and raise the owner''s allowance: only the owner (personal library, or a team key the owner created). Billing members cannot top up for the owner.' }
+    AssetQuota:
+      type: object
+      required: [tier, usage, limits, full, nextTier, tiers, dailyCreateLimit, createdToday, scope]
+      properties:
+        tier: { $ref: '#/components/schemas/AssetPlan' }
+        usage:
+          type: object
+          required: [count, bytes]
+          properties:
+            count: { type: integer, minimum: 0 }
+            bytes: { type: integer, minimum: 0 }
+        limits:
+          type: object
+          required: [tier, maxCount, maxBytes, maxFileBytes, globalMaxBytes, nameMaxChars]
+          properties:
+            tier: { type: string }
+            maxCount: { type: integer, minimum: 0 }
+            maxBytes: { type: integer, minimum: 0 }
+            maxFileBytes: { type: integer, minimum: 0 }
+            globalMaxBytes: { type: integer, minimum: 0, description: Platform-wide ceiling; 0 disables it. }
+            nameMaxChars: { type: integer, const: 80 }
+        full: { type: boolean, description: True when no new asset fits (including plans where saving is closed). }
+        nextTier:
+          oneOf:
+            - $ref: '#/components/schemas/AssetPlan'
+            - type: 'null'
+          description: The next plan with more storage or items; null on the highest plan.
+        topupToNextTierUsd: { type: string, description: 'How much more to top up, in USD, to reach nextTier. Omitted when scope.canTopUp is false.' }
+        lifetimeTopupUsd: { type: string, description: 'The owner''s lifetime top-ups in USD as a decimal string, for example "25" or "12.50". Omitted when scope.canTopUp is false.' }
+        tiers: { type: array, items: { $ref: '#/components/schemas/AssetPlan' } }
+        dailyCreateLimit: { type: integer, minimum: 1, description: New assets allowed per owner allowance per UTC day. }
+        createdToday: { type: integer, minimum: 0 }
+        scope: { $ref: '#/components/schemas/AssetScope' }
+    AssetQuotaEnvelope:
+      allOf:
+        - $ref: '#/components/schemas/EnvelopeBase'
+        - type: object
+          required: [data]
+          properties:
+            code: { type: integer, const: 200 }
+            msg: { type: string, const: success }
+            data: { $ref: '#/components/schemas/AssetQuota' }
+    AssetDeletedEnvelope:
+      allOf:
+        - $ref: '#/components/schemas/EnvelopeBase'
+        - type: object
+          required: [data]
+          properties:
+            code: { type: integer, const: 200 }
+            msg: { type: string, const: success }
+            data:
+              type: object
+              required: [id, deleted]
+              properties:
+                id: { type: string }
+                deleted: { type: boolean, const: true }
     USDString:
       type: string
       pattern: '^-?[0-9]+(?:\.[0-9]+)?$'
@@ -2355,7 +2987,7 @@ components:
     GeminiGenerateContentRequest:
       type: object
       required: [contents]
-      description: Google Gemini `generateContent` request. Which generation parameters a model accepts comes from that model's `inputSchema` in `/v1/models` and the catalog; unsupported parameters return 400.
+      description: Google Gemini `generateContent` request. Which generation parameters a model accepts comes from that model's `inputSchema` in `/v1/models` and the catalog. Sampling parameters the model does not declare (temperature, topP, topK, penalties) are ignored and listed in the `X-Spicy-Ignored-Params` response header; any other unsupported parameter returns 400.
       properties:
         contents:
           type: array

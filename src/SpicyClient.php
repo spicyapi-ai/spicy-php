@@ -6,7 +6,9 @@
  * SpicyAPI serves image, video and audio generation models behind one API. This
  * package covers the asynchronous media workflow end to end: discover a model and its
  * input schema, upload local reference material, quote a request, submit it,
- * wait for a terminal state, and collect the result.
+ * wait for a terminal state, and collect the result. Files worth keeping go into
+ * the asset library ({@see SpicyClient::$assets}), where they get a stable
+ * `spicy://a/` reference that does not expire.
  *
  * Text models are deliberately out of scope: they speak the OpenAI, Anthropic
  * and Gemini wire formats, so the established PHP clients for those already work
@@ -151,6 +153,10 @@ enum TaskErrorCode: string
  * Documents (PDF, Office, iWork, plain text and Markdown) are reference files
  * for the models whose schema asks for one. The server checks only that the
  * bytes belong to the declared family; it does not read the content.
+ *
+ * LoRA weights travel as `application/octet-stream` ({@see self::Lora}): a
+ * `.safetensors` file, which commit checks is complete. The committed URI goes
+ * into `loras[].path`. The contract names no narrower type for it.
  */
 enum UploadContentType: string
 {
@@ -174,6 +180,10 @@ enum UploadContentType: string
     case Numbers = 'application/vnd.apple.numbers';
     case Text = 'text/plain';
     case Markdown = 'text/markdown';
+    case Lora = 'application/octet-stream';
+
+    /** LoRA weights have a ceiling of their own: 2 GiB, the `bytes` maximum of the request schema. */
+    public const MAX_LORA_BYTES = 2 * 1024 * 1024 * 1024;
 
     /** File extensions this client can map on its own. */
     private const EXTENSIONS = [
@@ -199,6 +209,7 @@ enum UploadContentType: string
         'txt' => 'text/plain',
         'md' => 'text/markdown',
         'markdown' => 'text/markdown',
+        'safetensors' => 'application/octet-stream',
     ];
 
     public function isImage(): bool
@@ -206,26 +217,41 @@ enum UploadContentType: string
         return str_starts_with($this->value, 'image/');
     }
 
-    /** True for the reference document types: neither image, audio nor video. */
+    /** True for LoRA weights, the upload type for `loras[].path`. */
+    public function isLora(): bool
+    {
+        return $this === self::Lora;
+    }
+
+    /** True for the reference document types: neither image, audio, video nor LoRA weights. */
     public function isDocument(): bool
     {
         return !$this->isImage()
+            && !$this->isLora()
             && !str_starts_with($this->value, 'video/')
             && !str_starts_with($this->value, 'audio/');
     }
 
     /**
      * Per-type ceiling, from the `createUploadUrl` description: 10 MiB for
-     * images, 90 MiB for supported audio and video (which is also the `bytes`
-     * maximum of 94371840 in the request schema). Documents get the same
-     * 90 MiB as audio and video. Audio and video additionally must be at most
-     * 600 seconds, which only the server can measure.
+     * images, 90 MiB for supported audio and video, and the same 90 MiB for
+     * documents. Audio and video additionally must be at most 600 seconds,
+     * which only the server can measure. LoRA weights get 2 GiB, which is also
+     * the `bytes` maximum of the request schema.
+     *
+     * A LoRA file that size can outlast the default ten-minute upload timeout
+     * on an ordinary uplink; raise `uploadTimeoutSeconds` on the client for big
+     * ones. The ticket itself stays valid for two hours.
      *
      * This is a local sanity check. The ticket's own `maxBytes` is what the
      * server will enforce, and {@see SpicyClient::uploadBytes()} checks that too.
      */
     public function maxBytes(): int
     {
+        if ($this->isLora()) {
+            return self::MAX_LORA_BYTES;
+        }
+
         return $this->isImage() ? 10 * 1024 * 1024 : 90 * 1024 * 1024;
     }
 
@@ -253,6 +279,94 @@ enum UploadContentType: string
     }
 }
 
+/* -- Asset library enums --------------------------------------------------- */
+
+/**
+ * Where a saved asset came from, and the `source` of a save.
+ *
+ * openapi.yaml `AssetCreateRequest.source`; the same values filter a listing.
+ */
+enum AssetSource: string
+{
+    case TaskOutput = 'task_output';
+    case Upload = 'upload';
+    case Url = 'url';
+}
+
+/**
+ * Orders of an asset listing.
+ *
+ * openapi.yaml `listAssets` `sort`. An unknown sort is refused locally rather
+ * than spending a request, and a slice of the per-minute read limit, on a 400.
+ * `scripts/check_contract.php` keeps this list equal to the contract's.
+ */
+enum AssetSort: string
+{
+    /** Newest first; the server's default. */
+    case Recent = 'recent';
+    case Oldest = 'oldest';
+    /** A to Z, ignoring case. */
+    case Name = 'name';
+    /** Largest first. */
+    case Size = 'size';
+}
+
+/**
+ * Machine-readable reasons the asset library attaches to a failed response as
+ * `data.reason`.
+ *
+ * openapi.yaml `ErrorEnvelope.data.reason`. The set is open: the server may add
+ * reasons later, so {@see SpicyApiError::$reason} carries any string it sends,
+ * unchanged, and an unknown one is best handled like an absent reason. Read a
+ * known one with {@see SpicyApiError::assetErrorReason()}, which returns null
+ * for anything outside this list.
+ */
+enum AssetErrorReason: string
+{
+    /** 400: the library opens after the owner's first top-up. */
+    case LibraryLocked = 'asset_library_locked';
+    /** 400: the allowance's storage or item count is used up. */
+    case LibraryFull = 'asset_library_full';
+    /** 400: the file is above the plan's per-file limit. */
+    case FileTooLarge = 'asset_file_too_large';
+    /** 429: today's (UTC) allowance of new assets is used up; see Retry-After. */
+    case DailyLimit = 'asset_daily_limit';
+    /** 503: storage is temporarily full across the platform. */
+    case StorageFull = 'asset_storage_full';
+    /** 403: the key's team role does not allow this change. */
+    case PermissionDenied = 'asset_permission_denied';
+    /** 403: this key or workspace cannot reach that library. */
+    case WorkspaceForbidden = 'asset_workspace_forbidden';
+    /**
+     * 409: the library already has a character with that name, ignoring case.
+     * Characters are named in the console, so the read-only API does not return
+     * it today.
+     */
+    case EntityNameTaken = 'asset_entity_name_taken';
+
+    /** What to do about it. */
+    public function guidance(): string
+    {
+        return match ($this) {
+            self::LibraryLocked => 'The asset library opens after the account owner\'s first top-up. Top up, then '
+                . 'save again; $client->assets->usage() lists the plans.',
+            self::LibraryFull => 'The library\'s plan is full: its storage or item count is used up. Delete assets '
+                . 'that are no longer needed, or reach the next plan; $client->assets->usage() shows both.',
+            self::FileTooLarge => 'The file is above the plan\'s per-file limit. Save a smaller file, or reach a plan '
+                . 'with a higher limit; $client->assets->usage() shows the limits.',
+            self::DailyLimit => 'Today\'s allowance of new assets is used up. It resets at 00:00 UTC; wait for '
+                . 'Retry-After before saving again.',
+            self::StorageFull => 'Storage is temporarily full across the platform. Back off and try again later.',
+            self::PermissionDenied => 'The team role of the member who created this key does not allow this change. '
+                . 'Use a key created by an owner or admin, or by the member who saved the asset.',
+            self::WorkspaceForbidden => 'This key cannot reach that library, for example because the member who '
+                . 'created it left the team. Create a new key in that workspace.',
+            self::EntityNameTaken => 'The library already has a character with that name, ignoring case. Choose '
+                . 'another name.',
+        };
+    }
+}
+
 /* -- Exceptions ------------------------------------------------------------ */
 
 /**
@@ -266,6 +380,12 @@ enum UploadContentType: string
  * It is spelled out rather than called `code` because `\Exception` already owns
  * that name; `getCode()` mirrors it, and reads 0 when there was no envelope at
  * all, which `$businessCode` reports honestly as null.
+ *
+ * `$reason` is the failure envelope's `data.reason` when the server sent one,
+ * and null otherwise. Branch on it (or on the business code) rather than on the
+ * message, which follows the account's error language. See
+ * {@see AssetErrorReason} for the values in use today; an unknown value is
+ * passed through as received.
  */
 class SpicyApiError extends \RuntimeException
 {
@@ -279,8 +399,18 @@ class SpicyApiError extends \RuntimeException
         public readonly string $requestId = '',
         public readonly ?float $retryAfterSeconds = null,
         ?\Throwable $previous = null,
+        public readonly ?string $reason = null,
     ) {
         parent::__construct($message, $businessCode ?? 0, $previous);
+    }
+
+    /**
+     * `$reason` as one of the asset library reasons the contract lists today,
+     * or null when it is absent or a value this package does not know yet.
+     */
+    public function assetErrorReason(): ?AssetErrorReason
+    {
+        return $this->reason === null ? null : AssetErrorReason::tryFrom($this->reason);
     }
 
     /**
@@ -306,9 +436,17 @@ class SpicyApiError extends \RuntimeException
      * three 503 codes are the reason this method exists: `503`, `50301` and
      * `50302` share one HTTP status and call for three different responses, so
      * branching on the status alone is wrong.
+     *
+     * A known `$reason` is more specific than the business code it arrives
+     * with (a full asset library is a plain 400), so it is answered first.
      */
     public function guidance(): string
     {
+        $byReason = $this->assetErrorReason();
+        if ($byReason !== null) {
+            return $byReason->guidance();
+        }
+
         return match ($this->businessCode) {
             40003 => 'The uploaded bytes do not match the ticket: size, media type or file signature '
                 . 'differs from what the ticket declared. Request a fresh upload ticket and upload the '
@@ -349,11 +487,12 @@ class SpicyApiError extends \RuntimeException
     public function describe(): string
     {
         return sprintf(
-            '%s (http=%d code=%s request_id=%s)',
+            '%s (http=%d code=%s request_id=%s%s)',
             $this->getMessage(),
             $this->status,
             $this->businessCode === null ? '-' : (string) $this->businessCode,
             $this->requestId === '' ? '-' : $this->requestId,
+            $this->reason === null ? '' : ' reason=' . $this->reason,
         );
     }
 }
@@ -743,6 +882,16 @@ final class SpicyClient
     private readonly Transport $transport;
 
     /**
+     * The asset library the key reaches: the personal library for a personal
+     * key, or the team's shared library for a team key.
+     *
+     * Save files once and reference them as `spicy://a/<id>` in any media field
+     * of model inputs sent with keys of the same workspace, until they are
+     * deleted. Its characters are at `$client->assets->characters`.
+     */
+    public readonly SpicyAssets $assets;
+
+    /**
      * The API key is read from the environment and from nowhere else.
      *
      * There is intentionally no way to pass a key as an argument: a key in an
@@ -787,6 +936,14 @@ final class SpicyClient
         $this->apiKey = $key;
         $this->baseUrl = self::normalizeBaseUrl($baseUrl);
         $this->transport = $transport ?? (extension_loaded('curl') ? new CurlTransport() : new StreamTransport());
+        // Every asset library call is safe to repeat: reads, a rename and a delete are idempotent
+        // by contract, and a save always carries an Idempotency-Key, the same one on every attempt.
+        $this->assets = new SpicyAssets(
+            $this,
+            fn (string $method, string $path, ?array $body = null, array $headers = []): array => $this->requireArray(
+                $this->request($method, $path, body: $body, headers: $headers, retryable: true),
+            ),
+        );
     }
 
     /**
@@ -1125,6 +1282,7 @@ final class SpicyClient
                 // Each attempt's timeout is clamped to the remaining budget. Without that, a
                 // 30-second request timeout plus two automatic retries can make
                 // waitForTerminal($id, 5.0) block for over ninety seconds before it throws.
+                $pollDeadline = $this->now() + min($this->requestTimeoutSeconds, $remaining);
                 $task = $this->getTask($id, min($this->requestTimeoutSeconds, $remaining));
             } catch (SpicyTimeoutError) {
                 // One polling attempt timing out is not this wait failing: while budget remains,
@@ -1133,6 +1291,21 @@ final class SpicyClient
                 // polling for), and it promotes one piece of network turbulence into the end of
                 // the whole wait. When the budget genuinely runs out, the floor at the top of the
                 // loop breaks out and throws the one below, which carries the taskId.
+            } catch (SpicyApiError $error) {
+                // request() hands back a retryable failure at once when its Retry-After is longer
+                // than the one poll had left. Within the client's own retry ceiling that is still
+                // just one poll that did not land - the same as a poll timing out - so wait as
+                // asked (inside this wait's budget) and poll again. Anything else - a longer
+                // Retry-After, retries used up, or a failure no retry can fix - is the caller's to
+                // see, as before.
+                if (!$error->isRetryable()
+                    || $error->retryAfterSeconds === null
+                    || $error->retryAfterSeconds > $this->maxRetryDelaySeconds
+                    || $error->retryAfterSeconds <= $pollDeadline - $this->now()) {
+                    throw $error;
+                }
+                $this->sleep(min($error->retryAfterSeconds, max(0.0, $deadline - $this->now())));
+                continue;
             }
 
             if ($task !== null) {
@@ -1404,6 +1577,9 @@ final class SpicyClient
      * `bytes` must be the exact length that will be PUT. The commit step
      * compares it, and a mismatch is business code `40003`.
      *
+     * LoRA weights ({@see UploadContentType::Lora}) may be up to 2 GiB, and
+     * their ticket stays valid for two hours.
+     *
      * Not marked retryable: each call issues a new ticket, so a blind retry
      * quietly leaves an abandoned one behind.
      *
@@ -1438,8 +1614,12 @@ final class SpicyClient
      * signature, hashes it, and copies it to an immutable private key.
      *
      * The returned `uri` — `spicy://f/fil_...` — is the value to put in a model
-     * input field. The ticket's `key` is only a compatibility alias and is not
-     * usable before this call succeeds.
+     * input field; for LoRA weights, in `loras[].path`. The ticket's `key` is
+     * only a compatibility alias and is not usable before this call succeeds.
+     *
+     * The URI lasts one day. To keep a file longer, save it to the asset
+     * library with `$client->assets->create(source: 'upload', fileId: ...)`,
+     * or upload and save in one call with `$client->assets->uploadFile()`.
      *
      * Business code `40003` here means the bytes did not match the ticket;
      * request a new ticket and upload again rather than retrying the commit.
@@ -1944,7 +2124,15 @@ final class SpicyClient
             // When Retry-After exceeds our own waiting ceiling, do not sit it out: hand the error
             // straight back so the caller can schedule it themselves, rather than holding a PHP
             // process asleep.
-            if ($error->retryAfterSeconds !== null && $error->retryAfterSeconds > $this->maxRetryDelaySeconds) {
+            //
+            // The same goes for a wait longer than this call has left. Sleeping out the budget
+            // would end in "the request exceeded the local timeout" in place of what the server
+            // actually said, burying its business code, reason, Retry-After and request_id under a
+            // timeout that never happened.
+            if ($error->retryAfterSeconds !== null && (
+                $error->retryAfterSeconds > $this->maxRetryDelaySeconds
+                || $error->retryAfterSeconds > $deadline - $this->now()
+            )) {
                 throw $error;
             }
             $lastError = $error;
@@ -1985,6 +2173,12 @@ final class SpicyClient
         $message = is_string($decoded['msg'] ?? null) && $decoded['msg'] !== ''
             ? $decoded['msg']
             : sprintf('the request failed with HTTP %d', $response->status);
+        // Any non-empty string is kept verbatim, so a reason added on the server later still
+        // reaches the caller; anything else (absent, empty, not a string) reads as no reason.
+        $data = $decoded['data'] ?? null;
+        $reason = is_array($data) && is_string($data['reason'] ?? null) && $data['reason'] !== ''
+            ? $data['reason']
+            : null;
 
         return new SpicyApiError(
             $message,
@@ -1992,6 +2186,7 @@ final class SpicyClient
             businessCode: $code,
             requestId: $requestId,
             retryAfterSeconds: self::parseRetryAfter($response->header('Retry-After')),
+            reason: $reason,
         );
     }
 
@@ -2169,6 +2364,641 @@ final class SpicyClient
         }
 
         return $data;
+    }
+}
+
+/* -- Asset library --------------------------------------------------------- */
+
+/**
+ * Argument checks and pagination shared by {@see SpicyAssets} and
+ * {@see SpicyAssetCharacters}.
+ *
+ * Every check runs before a request is sent: an empty id would otherwise
+ * address the collection (`/assets/` lists instead of reading one asset), and
+ * a line break has no business in a URL or a header.
+ *
+ * @internal
+ */
+trait AssetArguments
+{
+    /** @var \Closure(string, string, array<string,mixed>|null=, array<string,string>=): array<string,mixed> */
+    private readonly \Closure $send;
+
+    private static function identifier(string $value, string $label): string
+    {
+        $trimmed = trim($value);
+        if ($trimmed === '') {
+            throw new \InvalidArgumentException($label . ' is required');
+        }
+        if (strpbrk($trimmed, "\r\n") !== false) {
+            throw new \InvalidArgumentException($label . ' must not contain line breaks');
+        }
+
+        return $trimmed;
+    }
+
+    /**
+     * Accept either the bare id (`ast_...`) or the reference used in model
+     * inputs (`spicy://a/ast_...`), so a value copied from either place works.
+     */
+    private static function bareAssetId(string $value, string $label = 'assetId'): string
+    {
+        $trimmed = self::identifier($value, $label);
+        if (str_starts_with($trimmed, SpicyAssets::URI_PREFIX)) {
+            return self::identifier(substr($trimmed, strlen(SpicyAssets::URI_PREFIX)), $label);
+        }
+
+        return $trimmed;
+    }
+
+    /**
+     * A filter that is either left off (null) or a non-blank string, sent unchanged.
+     *
+     * A blank string is not "unset": the caller computed a filter and it came
+     * out empty. Dropping it silently would hand back the unfiltered list;
+     * sending it earns a 400 that does not name the parameter.
+     */
+    private static function optionalText(?string $value, string $label): ?string
+    {
+        if ($value === null) {
+            return null;
+        }
+        if (trim($value) === '') {
+            throw new \InvalidArgumentException(sprintf(
+                '%s was given an empty value; pass null to leave that filter off',
+                $label,
+            ));
+        }
+
+        return $value;
+    }
+
+    /** Only non-positive values are refused here: the upper bound belongs to the server. */
+    private static function optionalLimit(?int $limit): ?string
+    {
+        if ($limit === null) {
+            return null;
+        }
+        if ($limit < 1) {
+            throw new \InvalidArgumentException('limit must be a positive integer');
+        }
+
+        return (string) $limit;
+    }
+
+    /** @param array<string,string|null> $values */
+    private static function withQuery(string $path, array $values): string
+    {
+        $present = array_filter($values, static fn (?string $value): bool => $value !== null);
+
+        return $present === [] ? $path : $path . '?' . http_build_query($present);
+    }
+
+    /**
+     * Follow `nextCursor` until the last page, where it is absent, repeating
+     * every other parameter unchanged.
+     *
+     * A cursor that comes back twice would loop forever and burn the rate
+     * limit for nothing, so it is refused.
+     *
+     * @param array<string,string|null> $query
+     *
+     * @return \Generator<int, array<string,mixed>>
+     */
+    private function pages(string $path, array $query, string $what): \Generator
+    {
+        $seen = [];
+        while (true) {
+            $page = ($this->send)('GET', self::withQuery($path, $query));
+            foreach ($page['items'] ?? [] as $item) {
+                if (is_array($item)) {
+                    yield $item;
+                }
+            }
+
+            $next = $page['nextCursor'] ?? null;
+            if (!is_string($next) || $next === '') {
+                return;
+            }
+            if (isset($seen[$next])) {
+                throw new SpicyApiError(sprintf('the %s returned a cursor it had already returned', $what), status: 200);
+            }
+            $seen[$next] = true;
+            $query['cursor'] = $next;
+        }
+    }
+}
+
+/**
+ * The characters of the library the key reaches, read-only.
+ *
+ * A character is a named, ordered set of images arranged in the console. It
+ * references assets instead of copying them, so each image carries its own
+ * `spicy://a/<id>` `uri`. To use a character in a generation request, put the
+ * `uri` of its images, in order, into the model's reference image field.
+ *
+ * Personas became characters in the personal library on 2026-10-12. Existing
+ * `spicy://p/<id>` references keep resolving to the same images; new code
+ * should use the `spicy://a/` references listed here.
+ *
+ * Reach it as `$client->assets->characters`; it is not meant to be
+ * constructed directly.
+ */
+final class SpicyAssetCharacters
+{
+    use AssetArguments;
+
+    /** @internal */
+    public function __construct(\Closure $send)
+    {
+        $this->send = $send;
+    }
+
+    /**
+     * One page of characters, newest first: `items` and, unless this is the
+     * last page, `nextCursor`.
+     *
+     * `GET /api/v1/assets/entities`. Each character has `id`, `name`, `note`,
+     * `cover`, `assets` (its images in order) and `count`.
+     *
+     * @param string|null $assetId Keep only the characters that contain this
+     *                             asset (`ast_...` or `spicy://a/ast_...`).
+     * @param string|null $cursor  The previous page's `nextCursor`, unchanged.
+     * @param int|null    $limit   Page size; the server defaults to 50.
+     *
+     * @return array<string,mixed>
+     */
+    public function list(?string $assetId = null, ?string $cursor = null, ?int $limit = null): array
+    {
+        return ($this->send)('GET', self::withQuery('/assets/entities', $this->listQuery($assetId, $cursor, $limit)));
+    }
+
+    /**
+     * Every character, page by page. `$limit` sets the page size, not the total.
+     *
+     * The arguments are checked when this is called, not when iteration
+     * starts, so a bad value fails where it was written.
+     *
+     * @return \Generator<int, array<string,mixed>>
+     */
+    public function iterAll(?string $assetId = null, ?string $cursor = null, ?int $limit = null): \Generator
+    {
+        return $this->pages('/assets/entities', $this->listQuery($assetId, $cursor, $limit), 'character listing');
+    }
+
+    /**
+     * One character with its images in order, each with a fresh private
+     * `previewUrl`.
+     *
+     * `GET /api/v1/assets/entities/{entityId}`. An unknown character, and one
+     * outside the key's library, are both answered with 404.
+     *
+     * @return array<string,mixed>
+     */
+    public function get(string $characterId): array
+    {
+        return ($this->send)('GET', '/assets/entities/' . rawurlencode(self::identifier($characterId, 'characterId')));
+    }
+
+    /** @return array<string,string|null> */
+    private function listQuery(?string $assetId, ?string $cursor, ?int $limit): array
+    {
+        return [
+            'assetId' => $assetId === null ? null : self::bareAssetId($assetId),
+            'cursor' => self::optionalText($cursor, 'cursor'),
+            'limit' => self::optionalLimit($limit),
+        ];
+    }
+}
+
+/**
+ * The asset library the key reaches.
+ *
+ * That is the personal library for a personal key, and the team's shared
+ * library for a team key. Files are kept until they are deleted, each with a
+ * stable `spicy://a/<id>` reference that works in any media field of model
+ * inputs sent with keys of the same workspace. With a team key, the current
+ * role of the member who created it decides what may change (see
+ * `usage()['scope']`).
+ *
+ * Reach it as `$client->assets`; it is not meant to be constructed directly.
+ * Responses never contain a public or permanent link: `previewUrl` is a
+ * private preview signed for at most 20 minutes, so store `uri`, never
+ * `previewUrl`.
+ *
+ * Asset ids are accepted as `ast_...` or as the `spicy://a/ast_...`
+ * reference. Invalid arguments throw \InvalidArgumentException before any
+ * request is sent; a refusal from the server throws {@see SpicyApiError} with
+ * its `$reason` (see {@see AssetErrorReason}).
+ *
+ * Listing and reading share a limit of 60 requests per minute per account,
+ * and saving one of 30 per minute.
+ */
+final class SpicyAssets
+{
+    use AssetArguments;
+
+    /** Prefix of a saved asset's stable reference, as in `spicy://a/ast_...`. */
+    public const URI_PREFIX = 'spicy://a/';
+
+    /**
+     * Only used to cut the default name of an uploaded file; a name passed
+     * explicitly is the server's to judge.
+     */
+    public const NAME_MAX_CHARS = 80;
+
+    /** Read-only access to the library's characters. */
+    public readonly SpicyAssetCharacters $characters;
+
+    /** @internal */
+    public function __construct(private readonly SpicyClient $client, \Closure $send)
+    {
+        $this->send = $send;
+        $this->characters = new SpicyAssetCharacters($send);
+    }
+
+    /**
+     * Save a file to the library and return the saved asset.
+     *
+     * `POST /api/v1/assets`. Exactly one source per call:
+     *
+     *  - `source: 'task_output'` with `taskId` and either the output `key` or
+     *    its zero-based `index` (the order of `output.assets` in the task
+     *    record). The task must be one of your own successful tasks; with a
+     *    team key, one of the team's.
+     *  - `source: 'upload'` with `fileId`, a committed upload (`fil_...` or
+     *    `spicy://f/fil_...`).
+     *  - `source: 'url'` with `url`, a public http or https address on port 80
+     *    or 443 without credentials. The server downloads it once and reads the
+     *    type from the file itself.
+     *
+     * `name` is optional; the server defaults to "Saved asset". Saving the same
+     * source again returns the asset you already have and uses no extra space.
+     *
+     * The server requires an `Idempotency-Key` on every save. One is generated
+     * when `$idempotencyKey` is null, which also makes the automatic retry of
+     * this call safe: every attempt carries the same key. Pass your own to
+     * replay the same save safely after an uncertain response, for example
+     * across a process restart; the server binds the key to the exact request
+     * for 24 hours.
+     *
+     * @return array<string,mixed>
+     */
+    public function create(
+        AssetSource|string $source,
+        ?string $taskId = null,
+        ?string $key = null,
+        ?int $index = null,
+        ?string $fileId = null,
+        ?string $url = null,
+        ?string $name = null,
+        ?string $idempotencyKey = null,
+    ): array {
+        $resolved = $source instanceof AssetSource ? $source : AssetSource::tryFrom($source);
+        if ($resolved === null) {
+            throw new \InvalidArgumentException(sprintf(
+                'source must be one of %s, not "%s"',
+                implode(', ', array_map(static fn (AssetSource $case): string => $case->value, AssetSource::cases())),
+                $source,
+            ));
+        }
+
+        // A save has exactly one source, so a field that belongs to another one is a caller
+        // mistake rather than something to drop quietly.
+        $given = ['taskId' => $taskId, 'key' => $key, 'index' => $index, 'fileId' => $fileId, 'url' => $url];
+        $allowed = match ($resolved) {
+            AssetSource::TaskOutput => ['taskId', 'key', 'index'],
+            AssetSource::Upload => ['fileId'],
+            AssetSource::Url => ['url'],
+        };
+        $foreign = array_keys(array_filter(
+            $given,
+            static fn (mixed $value, string $field): bool => $value !== null && !in_array($field, $allowed, true),
+            ARRAY_FILTER_USE_BOTH,
+        ));
+        if ($foreign !== []) {
+            throw new \InvalidArgumentException(sprintf(
+                '%s does not apply to source "%s"; send exactly one source per save',
+                implode(', ', $foreign),
+                $resolved->value,
+            ));
+        }
+
+        $body = ['source' => $resolved->value];
+        switch ($resolved) {
+            case AssetSource::TaskOutput:
+                $body['taskId'] = self::identifier($taskId ?? '', 'taskId');
+                if ($key !== null) {
+                    // Not trimmed: an output key is the server's to judge, whitespace included.
+                    if (trim($key) === '') {
+                        throw new \InvalidArgumentException('key must not be blank');
+                    }
+                    $body['key'] = $key;
+                }
+                if ($index !== null) {
+                    if ($index < 0) {
+                        throw new \InvalidArgumentException('index must be a non-negative integer');
+                    }
+                    $body['index'] = $index;
+                }
+                break;
+            case AssetSource::Upload:
+                $body['fileId'] = self::identifier($fileId ?? '', 'fileId');
+                break;
+            case AssetSource::Url:
+                if ($url === null || trim($url) === '') {
+                    throw new \InvalidArgumentException('url is required');
+                }
+                $body['url'] = $url;
+                break;
+        }
+        if ($name !== null) {
+            $body['name'] = $name;
+        }
+
+        if ($idempotencyKey === null) {
+            $headerKey = SpicyClient::idempotencyKey();
+        } else {
+            // Contract: 1 to 128 characters, bound to the request for 24 hours.
+            $headerKey = self::identifier($idempotencyKey, 'idempotencyKey');
+            if (strlen($headerKey) > 128) {
+                throw new \InvalidArgumentException('idempotencyKey must be at most 128 characters');
+            }
+        }
+
+        return ($this->send)('POST', '/assets', $body, ['Idempotency-Key' => $headerKey]);
+    }
+
+    /**
+     * One page of ready assets: `items` and, unless this is the last page,
+     * `nextCursor`.
+     *
+     * `GET /api/v1/assets`. Use {@see self::iterAll()} to walk every page.
+     *
+     * @param string|null                                  $kind         `image`, `video` or `audio`.
+     * @param AssetSource|string|list<AssetSource|string>|null $source   One source or several (sent
+     *                                                                   comma-separated). An empty list
+     *                                                                   filters nothing.
+     * @param string|null                                  $q            Case-insensitive substring of the name.
+     * @param bool|null                                    $favorite     True lists only favorites, false only
+     *                                                                   the assets that are not favorites;
+     *                                                                   null leaves the filter off.
+     * @param string|null                                  $collectionId Only the assets in this folder (a
+     *                                                                   collection of the same library).
+     *                                                                   Folders are created in the console;
+     *                                                                   an id outside the key's library is
+     *                                                                   answered with 404.
+     * @param string|null                                  $entityId     Only the images of this character
+     *                                                                   (see `characters`); an unknown id
+     *                                                                   gives an empty page.
+     * @param AssetSort|string|null                        $sort         `recent` (the default, newest first),
+     *                                                                   `oldest`, `name` or `size`.
+     * @param string|null                                  $cursor       The previous page's `nextCursor`,
+     *                                                                   unchanged and with the same filters
+     *                                                                   and sort; never build one. A cursor
+     *                                                                   sent with a different sort is
+     *                                                                   rejected with 400.
+     * @param int|null                                     $limit        Page size; the server defaults to 100.
+     *
+     * @return array<string,mixed>
+     */
+    public function list(
+        ?string $kind = null,
+        AssetSource|string|array|null $source = null,
+        ?string $q = null,
+        ?bool $favorite = null,
+        ?string $collectionId = null,
+        ?string $entityId = null,
+        AssetSort|string|null $sort = null,
+        ?string $cursor = null,
+        ?int $limit = null,
+    ): array {
+        $query = $this->listQuery($kind, $source, $q, $favorite, $collectionId, $entityId, $sort, $cursor, $limit);
+
+        return ($this->send)('GET', self::withQuery('/assets', $query));
+    }
+
+    /**
+     * Every matching asset, page by page, following `nextCursor` until the
+     * last page.
+     *
+     * The same filters and sort go out on every page, as a cursor only works
+     * with the ones it was issued for. `$limit` sets the page size, not the
+     * total; stop iterating to stop fetching. The arguments are checked when
+     * this is called, not when iteration starts.
+     *
+     * @param AssetSource|string|list<AssetSource|string>|null $source
+     *
+     * @return \Generator<int, array<string,mixed>>
+     */
+    public function iterAll(
+        ?string $kind = null,
+        AssetSource|string|array|null $source = null,
+        ?string $q = null,
+        ?bool $favorite = null,
+        ?string $collectionId = null,
+        ?string $entityId = null,
+        AssetSort|string|null $sort = null,
+        ?string $cursor = null,
+        ?int $limit = null,
+    ): \Generator {
+        $query = $this->listQuery($kind, $source, $q, $favorite, $collectionId, $entityId, $sort, $cursor, $limit);
+
+        return $this->pages('/assets', $query, 'asset listing');
+    }
+
+    /**
+     * One asset with a fresh private `previewUrl`.
+     *
+     * `GET /api/v1/assets/{assetId}`. An unknown asset, another account's
+     * asset and one in a library this key does not reach are all answered with
+     * the same 404.
+     *
+     * @return array<string,mixed>
+     */
+    public function get(string $assetId): array
+    {
+        return ($this->send)('GET', self::assetPath($assetId));
+    }
+
+    /**
+     * Rename an asset, mark or unmark it as a favorite, or both; returns the
+     * updated asset.
+     *
+     * `PATCH /api/v1/assets/{assetId}`. Only the fields you pass change, and
+     * the `uri` stays the same. Favorites belong to the library, so everyone in
+     * a team sees the same ones. Repeating the request is safe, so no
+     * Idempotency-Key is sent.
+     *
+     * @return array<string,mixed>
+     */
+    public function update(string $assetId, ?string $name = null, ?bool $favorite = null): array
+    {
+        $body = [];
+        if ($name !== null) {
+            $body['name'] = $name;
+        }
+        if ($favorite !== null) {
+            $body['favorite'] = $favorite;
+        }
+        if ($body === []) {
+            // The server would answer an empty body with a misleading "invalid name".
+            throw new \InvalidArgumentException('update needs a name, a favorite flag, or both');
+        }
+
+        return ($this->send)('PATCH', self::assetPath($assetId), $body);
+    }
+
+    /**
+     * Delete an asset; returns `['id' => ..., 'deleted' => true]`.
+     *
+     * `DELETE /api/v1/assets/{assetId}`. It disappears at once, is removed
+     * from every folder and character, and its `uri` stops working in new
+     * requests. Deleting an unknown or already deleted asset returns the same
+     * result, so repeating it is safe and no Idempotency-Key is sent.
+     *
+     * @return array<string,mixed>
+     */
+    public function delete(string $assetId): array
+    {
+        return ($this->send)('DELETE', self::assetPath($assetId));
+    }
+
+    /**
+     * The storage plan, what is stored, the limits and how many assets were
+     * saved today.
+     *
+     * `GET /api/v1/assets/usage`. `scope` says which library the key reaches
+     * (`workspaceId`, `personal`), the role it acts with and whether it may
+     * save (`canWrite`) or top up (`canTopUp`). When `canTopUp` is false (a
+     * team key whose creator is not the owner), `lifetimeTopupUsd` and
+     * `topupToNextTierUsd` are omitted, so read them with `?? null`.
+     *
+     * @return array<string,mixed>
+     */
+    public function usage(): array
+    {
+        return ($this->send)('GET', '/assets/usage');
+    }
+
+    /**
+     * Upload a local file and save it to the library in one call; returns the
+     * saved asset.
+     *
+     * The upload goes through {@see SpicyClient::uploadFile()}, so its type
+     * inference and size limits apply. `$name` defaults to the file's base
+     * name, cut to 80 characters. Every call uploads again, so there is no
+     * idempotency key to pass: the save step uses a fresh one for its own
+     * retries. Nothing is saved when the upload fails.
+     *
+     * @return array<string,mixed>
+     */
+    public function uploadFile(string $path, ?string $name = null, ?UploadContentType $contentType = null): array
+    {
+        $uploaded = $this->client->uploadFile($path, $contentType);
+        $fileId = $uploaded['fileId'] ?? $uploaded['uri'] ?? null;
+        if (!is_string($fileId) || $fileId === '') {
+            throw new SpicyApiError('the committed upload carried no fileId', status: 200, businessCode: 200);
+        }
+        if ($name === null) {
+            $name = self::defaultName($path);
+        }
+
+        return $this->create(source: AssetSource::Upload, fileId: $fileId, name: $name);
+    }
+
+    /**
+     * The file's base name, cut to {@see self::NAME_MAX_CHARS} characters, or
+     * null to let the server choose. Cut by character, not by byte, without
+     * relying on ext-mbstring, so a multi-byte name is never split mid-character.
+     */
+    private static function defaultName(string $path): ?string
+    {
+        $base = trim(basename($path));
+        if ($base === '') {
+            return null;
+        }
+        if (preg_match('/^.{1,' . self::NAME_MAX_CHARS . '}/us', $base, $match) === 1) {
+            return $match[0];
+        }
+
+        // Not valid UTF-8: fall back to bytes and let the server judge the result.
+        return substr($base, 0, self::NAME_MAX_CHARS);
+    }
+
+    private static function assetPath(string $assetId): string
+    {
+        return '/assets/' . rawurlencode(self::bareAssetId($assetId));
+    }
+
+    /**
+     * @param AssetSource|string|list<AssetSource|string>|null $source
+     *
+     * @return array<string,string|null>
+     */
+    private function listQuery(
+        ?string $kind,
+        AssetSource|string|array|null $source,
+        ?string $q,
+        ?bool $favorite,
+        ?string $collectionId,
+        ?string $entityId,
+        AssetSort|string|null $sort,
+        ?string $cursor,
+        ?int $limit,
+    ): array {
+        $sources = null;
+        if ($source !== null) {
+            $values = [];
+            foreach (is_array($source) ? $source : [$source] as $item) {
+                $values[] = self::sourceValue($item);
+            }
+            // An empty list filters nothing, so it is the same as leaving the filter off.
+            $sources = $values === [] ? null : implode(',', $values);
+        }
+
+        $sortValue = null;
+        if ($sort !== null) {
+            $resolved = $sort instanceof AssetSort ? $sort : AssetSort::tryFrom($sort);
+            if ($resolved === null) {
+                throw new \InvalidArgumentException(sprintf(
+                    'sort must be one of %s, not "%s"',
+                    implode(', ', array_map(static fn (AssetSort $case): string => $case->value, AssetSort::cases())),
+                    $sort,
+                ));
+            }
+            $sortValue = $resolved->value;
+        }
+
+        return [
+            'kind' => self::optionalText($kind, 'kind'),
+            'source' => $sources,
+            'q' => self::optionalText($q, 'q'),
+            // False is a filter of its own ("not favorites"), so it is sent rather than dropped;
+            // only null leaves the filter off.
+            'favorite' => $favorite === null ? null : ($favorite ? 'true' : 'false'),
+            'collectionId' => $collectionId === null ? null : self::identifier($collectionId, 'collectionId'),
+            'entityId' => $entityId === null ? null : self::identifier($entityId, 'entityId'),
+            'sort' => $sortValue,
+            'cursor' => self::optionalText($cursor, 'cursor'),
+            'limit' => self::optionalLimit($limit),
+        ];
+    }
+
+    private static function sourceValue(mixed $item): string
+    {
+        if ($item instanceof AssetSource) {
+            return $item->value;
+        }
+        $resolved = is_string($item) ? AssetSource::tryFrom(trim($item)) : null;
+        if ($resolved === null) {
+            throw new \InvalidArgumentException(sprintf(
+                'source must be one of %s',
+                implode(', ', array_map(static fn (AssetSource $case): string => $case->value, AssetSource::cases())),
+            ));
+        }
+
+        return $resolved->value;
     }
 }
 
