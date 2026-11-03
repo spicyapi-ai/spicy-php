@@ -453,6 +453,10 @@ check('key omitted when not given', json_decode($t->calls[0]['body'], true) === 
 /* -- 10. An output is not always a file ------------------------------ */
 echo "outputs\n";
 $textOnly = ['taskId' => 't', 'state' => 'succeeded', 'output' => ['text' => 'transcribed lyrics']];
+$vectors = ['inputTokens' => 3, 'data' => [['index' => 0, 'embedding' => [-0.25, 0.5]]]];
+check('outputEmbeddings preserves vectors', SpicyClient::outputEmbeddings(['output' => ['embeddings' => $vectors]]) === $vectors);
+check('outputEmbeddings handles absent output', SpicyClient::outputEmbeddings([]) === null);
+check('outputEmbeddings handles malformed output', SpicyClient::outputEmbeddings(['output' => ['embeddings' => 'invalid']]) === null);
 check('outputText reads text', SpicyClient::outputText($textOnly) === 'transcribed lyrics');
 check('outputAssets is [] when there is no assets key', SpicyClient::outputAssets($textOnly) === []);
 check('readyAssets is [] when there is no assets key', SpicyClient::readyAssets($textOnly) === []);
