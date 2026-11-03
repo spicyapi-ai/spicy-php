@@ -1206,6 +1206,170 @@ paths:
         '500': { $ref: '#/components/responses/OpenAIError' }
         '503': { $ref: '#/components/responses/OpenAIError' }
 
+  /v1/realtime:
+    get:
+      tags: [OpenAI Compatible]
+      operationId: connectRealtime
+      summary: Open a metered realtime WebSocket session
+      description: |
+        Uses Bearer API key authentication and a WebSocket upgrade. Every generated
+        turn is admitted, reserved and settled as a separate normal task before the
+        next turn can run. The handshake and each subsequent turn consume the same
+        generation rate-limit bucket as other developer generation requests.
+        X-Spicy-Task-Id identifies the first turn; the additive spicy_task_id field
+        on native response.created or transcription delta/completed events identifies later turns. Idle connections
+        do not reserve a future turn. Conversation and function-call references remain valid
+        within this connection. Reusing Idempotency-Key does not replay a live socket.
+        max_context_tokens bounds post-instruction history using native truncation;
+        system instructions and tool definitions share a separate 4096-token reserve.
+        Input transcription requires a separate transcription connection and cannot
+        be enabled as an unmetered side effect of a voice conversation.
+        Set intent=transcription for standalone transcription: each audio segment is
+        reserved before its first append, including models that emit text before commit.
+        max_audio_seconds bounds each segment (default 15, range 1 to 60). Commit
+        segments explicitly; this transport fixes automatic VAD to null and rejects
+        clearing processed audio before settlement. Final duration usage is billed
+        as input-audio quantity, separately from output-media duration.
+        Audio chunks are stored before delivery. Sessions last at most 30 minutes
+        and 256 turns. JSON text events are limited to 1 MiB; an input audio buffer
+        is limited to 32 MiB. Server-side WebSocket transport is supported here.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - { in: query, name: model, required: true, schema: { type: string }, description: Public realtime model or endpoint ID. }
+        - { in: query, name: intent, schema: { type: string, enum: [realtime, transcription], default: realtime } }
+        - { in: query, name: max_audio_seconds, schema: { type: integer, minimum: 1, maximum: 60, default: 15 }, description: Transcription only; other budget parameters are rejected in this mode. }
+        - { in: query, name: max_tokens, schema: { type: integer, minimum: 16, maximum: 32000, default: 512 } }
+        - { in: query, name: max_context_tokens, schema: { type: integer, minimum: 512, maximum: 123888, default: 4096 }, description: The context cap plus the instruction reserve and output cap must fit 128000 tokens. }
+      responses:
+        '101':
+          description: WebSocket session; response.done (voice) or input_audio_transcription.completed (transcription) carries final measured usage.
+          headers:
+            X-Spicy-Task-Id: { schema: { type: string } }
+        '400': { $ref: '#/components/responses/OpenAIError' }
+        '401': { $ref: '#/components/responses/OpenAIError' }
+        '402': { $ref: '#/components/responses/OpenAIError' }
+        '403': { $ref: '#/components/responses/OpenAIError' }
+        '409': { $ref: '#/components/responses/OpenAIError' }
+        '429': { $ref: '#/components/responses/OpenAIError' }
+        '503': { $ref: '#/components/responses/OpenAIError' }
+
+  /v1/audio/speech:
+    post:
+      tags: [OpenAI Compatible]
+      operationId: createSpeech
+      summary: Generate speech as an audio file
+      description: |
+        Uses the normal task admission, idempotency, pricing and settlement pipeline.
+        Returns the stored audio bytes only after successful settlement, with no JSON
+        wrapper or keepalive bytes. Waits up to two minutes. A timeout does not create
+        another task: retry using the same Idempotency-Key or retrieve X-Spicy-Task-Id.
+        Supported voices, formats and additional instructions depend on the selected
+        text-to-speech model's public schema. Binary audio output is supported here.
+        Stored audio is limited to 32 MiB per response; split long, slow uncompressed
+        narration into shorter requests.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [model, input, voice]
+              properties:
+                model: { type: string, description: Public text-to-speech model or endpoint ID. }
+                input: { type: string, minLength: 1, maxLength: 4096 }
+                voice: { type: string }
+                response_format: { type: string, enum: [mp3, opus, aac, flac, wav, pcm], default: mp3 }
+                speed: { type: number, minimum: 0.25, maximum: 4, default: 1 }
+                instructions: { type: string, description: Accepted only when present in the selected model schema. }
+                stream_format: { type: string, enum: [audio], default: audio }
+                user: { type: string, description: Accepted for SDK compatibility; not forwarded. }
+      responses:
+        '200':
+          description: Audio bytes, read from the authenticated task's stored output.
+          headers:
+            X-Spicy-Task-Id: { $ref: '#/components/headers/SpicyTaskId' }
+          content:
+            application/octet-stream:
+              schema: { type: string, format: binary }
+        '400': { $ref: '#/components/responses/OpenAIError' }
+        '401': { $ref: '#/components/responses/OpenAIError' }
+        '429': { $ref: '#/components/responses/OpenAIError' }
+        '503': { $ref: '#/components/responses/OpenAIError' }
+  /v1/embeddings:
+    post:
+      tags: [OpenAI Compatible]
+      operationId: createEmbedding
+      summary: Create vectors with an embedding model
+      description: |
+        Uses the normal task admission, idempotency, routing and settlement pipeline.
+        Waits up to two minutes for the accepted task to settle. The task ID is
+        returned in X-Spicy-Task-Id; after a timeout retrieve that task or retry with
+        the same Idempotency-Key. No second settlement path is used.
+        Each request accepts up to 128 inputs. The model page declares token and
+        dimension limits. Base64 output contains little-endian float32 values.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [model, input]
+              properties:
+                model: { type: string, description: Public embedding model or endpoint ID. }
+                input:
+                  oneOf:
+                    - { type: string, minLength: 1 }
+                    - { type: array, items: { type: string, minLength: 1 }, minItems: 1, maxItems: 128 }
+                    - { type: array, items: { type: integer, minimum: 0, maximum: 2147483647 }, minItems: 1, maxItems: 2048 }
+                    - { type: array, items: { type: array, items: { type: integer, minimum: 0, maximum: 2147483647 }, minItems: 1, maxItems: 2048 }, minItems: 1, maxItems: 128 }
+                dimensions: { type: integer, minimum: 1 }
+                encoding_format: { type: string, enum: [float, base64], default: float }
+                user: { type: string, description: Accepted for SDK compatibility; not forwarded. }
+      responses:
+        '200':
+          description: Embedding vectors in input order, with measured usage.
+          headers:
+            X-Spicy-Task-Id: { $ref: '#/components/headers/SpicyTaskId' }
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  object: { type: string, const: list }
+                  model: { type: string }
+                  data:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        object: { type: string, const: embedding }
+                        index: { type: integer, minimum: 0 }
+                        embedding:
+                          oneOf:
+                            - { type: array, items: { type: number } }
+                            - { type: string, contentEncoding: base64 }
+                  usage:
+                    type: object
+                    properties:
+                      prompt_tokens: { type: integer }
+                      total_tokens: { type: integer }
+        '400': { $ref: '#/components/responses/OpenAIError' }
+        '401': { $ref: '#/components/responses/OpenAIError' }
+        '402': { $ref: '#/components/responses/OpenAIError' }
+        '403': { $ref: '#/components/responses/OpenAIError' }
+        '404': { $ref: '#/components/responses/OpenAIError' }
+        '409': { $ref: '#/components/responses/OpenAIError' }
+        '413': { $ref: '#/components/responses/OpenAIError' }
+        '429': { $ref: '#/components/responses/OpenAIError' }
+        '500': { $ref: '#/components/responses/OpenAIError' }
+        '503': { $ref: '#/components/responses/OpenAIError' }
+
   /v1/responses:
     post:
       tags: [OpenAI Compatible]
@@ -1917,6 +2081,22 @@ components:
       description: First-party result metadata. Ready assets include directly usable temporary URLs; no download-ticket request is needed. Poll again to refresh an expired URL. Temporary URLs are bearer access grants; never attach your API key when fetching them.
       properties:
         text: { type: string, description: Text result (chat, transcription). For transcription with multichannel on, one line per channel in channel order. }
+        embeddings:
+          type: object
+          additionalProperties: false
+          required: [data, inputTokens]
+          properties:
+            inputTokens: { type: integer, minimum: 1, description: Measured input token count from the model response. }
+            data:
+              type: array
+              maxItems: 128
+              items:
+                type: object
+                additionalProperties: false
+                required: [index, embedding]
+                properties:
+                  index: { type: integer, minimum: 0 }
+                  embedding: { type: array, items: { type: number }, minItems: 1, maxItems: 3072 }
         transcript:
           $ref: '#/components/schemas/TaskTranscript'
         assets:
@@ -1936,6 +2116,10 @@ components:
         durationSeconds: { type: number, description: Length of the transcribed audio in seconds. }
         words:
           type: array
+          items: { $ref: '#/components/schemas/TaskTranscriptWord' }
+        segments:
+          type: array
+          description: Timed phrases, including speaker labels when available; separate from word-level timestamps.
           items: { $ref: '#/components/schemas/TaskTranscriptWord' }
         channels:
           type: array
@@ -1979,9 +2163,14 @@ components:
             What the asset is: `video`, `image`, `audio` or a model-specific role. Video extend endpoints that join the
             source clip to the new footage return two assets in a fixed order: the joined clip first (`video`), then the
             newly generated part on its own (`segment`). Endpoints that return only the new part have no `segment` asset.
-            Video translation endpoints return the dubbed clip (`video`) followed by a subtitle file of the translated
-            speech (`subtitle`, `mime` `application/x-subrip`, an `.srt` file); the subtitle is kept for the same
-            retention period as the video.
+            Video translation endpoints return the dubbed clip (`video`); endpoints that also produce a subtitle file of
+            the translated speech add it as a second asset (`subtitle`, `mime` `application/x-subrip`, an `.srt` file),
+            kept for the same retention period as the video.
+            Image to 3D and text to 3D endpoints return one `mesh` asset: a binary glTF file (`mime` `model/gltf-binary`, a `.glb`
+            file with its textures embedded). The download is served as `application/octet-stream`.
+            Vector endpoints (text to SVG, image to SVG) return `image` assets with `mime` `image/svg+xml` (an `.svg` file built
+            from paths). Scripts, event handlers, external references and embedded bitmaps are removed or rejected before
+            delivery, and the file is served as an attachment.
         nsfw: { type: boolean }
         pending: { type: boolean }
         unavailable: { type: boolean }
@@ -2278,8 +2467,11 @@ components:
             `video-extend`, `video-analyze`, `character-animation`, `talking-avatar`, `lip-sync`,
             `video-to-audio` (returns the same video with a generated sound track), `frame-interpolation`
             (returns the same video at twice its frame rate, same length and audio), `video-translate` (returns the
-            same video dubbed into another language, plus a subtitle file as a `subtitle` asset), `layer-decomposition` (returns a base
-            image plus transparent layers, see `TaskOutputAsset.layer`), `speech-to-text`, `chat`. New values
+            same video dubbed into another language; some models also re-sync the lips or add a subtitle file as a
+            `subtitle` asset), `layer-decomposition` (returns a base
+            image plus transparent layers, see `TaskOutputAsset.layer`), `image-to-3d` (returns one textured 3D mesh as a
+            binary glTF `.glb` file, asset role `mesh`), `text-to-3d` (the same output, generated from a text prompt), `speech-to-text`, `realtime`, `realtime-transcription`, `audio-to-audio` (returns one
+            processed audio track, for example a speech recording with the noise removed), `chat`. New values
             appear as models are added, so treat the set as open.
         async: { type: boolean }
         mature:
@@ -2412,6 +2604,16 @@ components:
           description: Previously published identifiers that still resolve to this endpoint.
         family: { type: string }
         familyPageSlug: { type: string }
+        outputSpecs:
+          type: object
+          description: Optional output parameters of this generation endpoint in list responses. Keys are duration_seconds and resolution for video or resolution, size, width, height, aspect_ratio and output_format for images. Values project the public input schema; absence means unknown. Input media limits are not included.
+          additionalProperties:
+            type: object
+            properties:
+              enum: { type: array, items: { oneOf: [{ type: number }, { type: string }] } }
+              minimum: { type: number }
+              maximum: { type: number }
+              multipleOf: { type: number }
         familyDisplayName: { type: string }
         displayName: { type: string }
         provider:
@@ -2464,13 +2666,28 @@ components:
         offerEndsAt: { type: string, format: date-time }
         perMillionTokens:
           type: object
-          description: Standard per-million-token prices for text models.
+          description: Per-million-token prices. Parent rates apply to text when separate audio/image rates are present.
           required: [input, output]
           properties:
             input: { type: string }
             cachedInput: { type: string }
             output: { type: string }
             cacheWrite: { type: string }
+            audio:
+              type: object
+              description: Audio token rates; when present, the parent rates apply to text only. File transcription has only audio input; unsupported cached input and audio output are omitted.
+              required: [input]
+              properties:
+                input: { type: string }
+                cachedInput: { type: string }
+                output: { type: string }
+            image:
+              type: object
+              description: Image input token rates. This model does not generate images.
+              required: [input, cachedInput]
+              properties:
+                input: { type: string }
+                cachedInput: { type: string }
         listPrice:
           type: object
           description: >-

@@ -2,6 +2,10 @@
 
 The version of this package is its git tag; `composer.json` carries no version field.
 
+## 0.3.1
+
+- Add `outputEmbeddings()` for reading indexed vectors and their measured input token count.
+
 ## 0.3.0
 
 ### Added

@@ -1820,6 +1820,20 @@ final class SpicyClient
     }
 
     /**
+     * Returns the measured input token count and indexed vectors, when available.
+     *
+     * @param array<string, mixed> $task
+     * @return array<string, mixed>|null
+     */
+    public static function outputEmbeddings(array $task): ?array
+    {
+        $embeddings = $task['output']['embeddings'] ?? null;
+
+        return is_array($embeddings) && isset($embeddings['data']) && is_array($embeddings['data'])
+            ? $embeddings : null;
+    }
+
+    /**
      * The asset list of a task, always an array — empty when there is none.
      *
      * Assets may be `pending` (still being stored) or `unavailable` (gone), and

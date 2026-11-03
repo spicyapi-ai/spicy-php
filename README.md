@@ -227,6 +227,9 @@ See the asset library guide:
 
 ## Not every result is a file
 
+Embedding tasks expose their token count and indexed vectors through `SpicyClient::outputEmbeddings($task)`.
+When returned, timed phrases are available in `$task['output']['transcript']['segments']`.
+
 Speech-to-text answers in text, so check `SpicyClient::outputText($task)` before reaching for the
 assets. A transcription that reports timing also carries `output.transcript`, with the detected
 language and per-word start and end times. A layer decomposition returns a base image followed by
